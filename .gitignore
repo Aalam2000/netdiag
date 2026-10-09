@@ -1,0 +1,8 @@
+# NetDiag runtime data (создаётся на прод-сервере, в репе не нужно)
+data/
+*.jsonl
+heartbeat
+report.txt
+netdiag.log
+# PyCharm / IDEA
+.idea/
