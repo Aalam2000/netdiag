@@ -11,7 +11,13 @@ def now():
     return datetime.now(TZ)
 
 # ==== КОНФИГ ====
-TARGETS = [
+# Локальные цели — проверяем доступность роутера (шлюза)
+LOCAL_TARGETS = [
+    ("gw_80",  "192.168.0.1", 80),
+    ("gw_443", "192.168.0.1", 443),
+]
+# Внешние цели — проверяем доступность интернета
+EXTERNAL_TARGETS = [
     ("dns_google",  "8.8.8.8",       53),
     ("dns_cf",      "1.1.1.1",       53),
     ("dns_quad9",   "9.9.9.9",       53),
@@ -19,6 +25,7 @@ TARGETS = [
     ("https_cf",    "cloudflare.com",443),
     ("https_github","github.com",   443),
 ]
+TARGETS = LOCAL_TARGETS + EXTERNAL_TARGETS
 INTERVAL_SEC = 5
 TCP_TIMEOUT  = 2.0
 OUTAGE_MIN_SEC = 30
@@ -172,42 +179,68 @@ def build_report():
                 gaps.append((prev_ts.isoformat(), cur.isoformat(), dt))
         prev_ts = cur
 
+    # --- инциденты по каждой цели ---
     per = defaultdict(lambda: {"outages": [], "last_ok": True,
                                "start": None, "rtts_all": []})
-    all_down = {"last_ok": True, "start": None, "outages": []}
+    # --- "роутер недоступен" (обе gw-цели down) ---
+    gw_down = {"last_ok": True, "start": None, "outages": []}
+    # --- "интернет недоступен" (все внешние цели down) ---
+    net_down = {"last_ok": True, "start": None, "outages": []}
 
     for r in recs:
         ts = r["ts"]
-        ok_any = False
-        any_down = False
-        for n, d in r["data"].items():
+        data = r["data"]
+
+        # обновляем per-цели
+        for n, d in data.items():
             s = per[n]
             if d["ok"]:
-                ok_any = True
                 if d.get("rtt") is not None:
                     s["rtts_all"].append(d["rtt"])
                 if not s["last_ok"]:
                     s["outages"].append((s["start"], ts)); s["start"] = None
                 s["last_ok"] = True
             else:
-                any_down = True
                 if s["last_ok"]: s["start"] = ts
                 s["last_ok"] = False
-        if not ok_any and any_down:
-            if all_down["last_ok"]:
-                all_down["start"] = ts
-            all_down["last_ok"] = False
-        else:
-            if not all_down["last_ok"]:
-                all_down["outages"].append((all_down["start"], ts))
-                all_down["start"] = None
-            all_down["last_ok"] = True
 
+        # состояние шлюза — обе локальные цели
+        gw_local = [data.get(n) for n, _, _ in LOCAL_TARGETS]
+        gw_ok = any(d and d.get("ok") for d in gw_local)
+
+        # состояние интернета — хотя бы одна внешняя цель
+        ext_local = [data.get(n) for n, _, _ in EXTERNAL_TARGETS]
+        ext_ok = any(d and d.get("ok") for d in ext_local)
+
+        # шлюз упал
+        if not gw_ok:
+            if gw_down["last_ok"]:
+                gw_down["start"] = ts
+            gw_down["last_ok"] = False
+        else:
+            if not gw_down["last_ok"]:
+                gw_down["outages"].append((gw_down["start"], ts))
+                gw_down["start"] = None
+            gw_down["last_ok"] = True
+
+        # интернет упал
+        if not ext_ok:
+            if net_down["last_ok"]:
+                net_down["start"] = ts
+            net_down["last_ok"] = False
+        else:
+            if not net_down["last_ok"]:
+                net_down["outages"].append((net_down["start"], ts))
+                net_down["start"] = None
+            net_down["last_ok"] = True
+
+    # закрыть незакрытые
     for s in per.values():
         if not s["last_ok"] and s["start"]:
             s["outages"].append((s["start"], t_end))
-    if not all_down["last_ok"] and all_down["start"]:
-        all_down["outages"].append((all_down["start"], t_end))
+    for d in (gw_down, net_down):
+        if not d["last_ok"] and d["start"]:
+            d["outages"].append((d["start"], t_end))
 
     def long_only(lst):
         out = []
@@ -219,9 +252,43 @@ def build_report():
                 out.append((st, en, dt))
         return out
 
-    all_down_long = long_only(all_down["outages"])
+    gw_long  = long_only(gw_down["outages"])
+    net_long = long_only(net_down["outages"])
     per_long = {n: long_only(s["outages"]) for n, s in per.items()}
 
+    # --- классификация каждого сбоя ---
+    # Собираем все инциденты "что-то не работало" (объединяем по времени).
+    # Классифицируем: если внутри интервала шлюз был down — виновник роутер,
+    # если шлюз был ok, а интернета нет — виновник провайдер.
+    events = []
+    # по всем внешним целям — объединяем как один "интернет упал" = net_long
+    for st, en, dt in net_long:
+        # определяем состояние шлюза в этом интервале
+        gw_bad = False
+        for gst, gen, _ in gw_long:
+            # пересечение интервалов
+            if to_aware(gst) <= to_aware(en) and to_aware(st) <= to_aware(gen):
+                gw_bad = True; break
+        events.append({
+            "start": st, "end": en, "dur": dt,
+            "cause": "router" if gw_bad else "provider",
+        })
+    # отдельно: если шлюз падал, но интернет по нашим данным был жив —
+    # это тоже инцидент (роутер глючит, но интернет через него шёл).
+    for gst, gen, dt in gw_long:
+        inside_net = False
+        for st, en, _ in net_long:
+            if to_aware(st) <= to_aware(gst) and to_aware(gen) <= to_aware(en):
+                inside_net = True; break
+        if not inside_net:
+            events.append({
+                "start": gst, "end": gen, "dur": dt,
+                "cause": "router",
+            })
+    # сортировка по времени
+    events.sort(key=lambda e: to_aware(e["start"]))
+
+    # --- RTT статистика ---
     all_rtts = []
     for s in per.values():
         all_rtts.extend(s["rtts_all"])
@@ -235,53 +302,44 @@ def build_report():
                     max_rtt_ts = r["ts"]; break
             if max_rtt_ts: break
 
+    # --- формируем отчёт ---
     L = []
     L.append(f"Отчет за интервал с {fmt_dt(t_start)} по {fmt_dt(t_end)}")
     L.append("")
-    L.append("Диагностика проводилась методом TCP-подключения к внешним ресурсам:")
-    L.append("  DNS 8.8.8.8:53, DNS 1.1.1.1:53, DNS 9.9.9.9:53,")
-    L.append("  HTTPS google.com:443, HTTPS cloudflare.com:443, HTTPS github.com:443.")
+    L.append("Диагностика проводилась методом TCP-подключения:")
+    L.append("  Шлюз/роутер:      192.168.0.1:80, 192.168.0.1:443")
+    L.append("  Внешние ресурсы:  8.8.8.8:53, 1.1.1.1:53, 9.9.9.9:53,")
+    L.append("                    google.com:443, cloudflare.com:443, github.com:443")
     L.append(f"Проверка выполнялась каждые {INTERVAL_SEC} секунд.")
-    L.append("Сервер подключён проводом к шлюзу 192.168.0.1,")
-    L.append("Wi-Fi и TP-Link в цепи не участвуют.")
+    L.append("Сервер подключён проводом к роутеру 192.168.0.1.")
     L.append("")
 
     if gaps:
-        L.append("Внимание: в период наблюдения сервер был выключен:")
+        L.append("Внимание: в период наблюдения сервер был недоступен:")
         for st, en, dt in gaps:
             L.append(f"  с {fmt_dt(st)} по {fmt_dt(en)} ({fmt_dur(dt)}) — диагностика не проводилась.")
         L.append("")
 
-    if not all_down_long:
-        L.append("Сбоев доступа в интернет за период наблюдения не зафиксировано.")
+    if not events:
+        L.append("Сбоев в работе сети и интернета за период наблюдения не зафиксировано.")
     else:
-        L.append(f"За период наблюдения зафиксировано {len(all_down_long)} "
-                 f"сбоев доступа в интернет:")
+        L.append(f"За период наблюдения зафиксировано {len(events)} сбоев:")
         L.append("")
         total_dur = 0
-        for st, en, dt in all_down_long:
-            total_dur += dt
-            L.append(f"  Сбой доступа в интернет с {fmt_dt(st)} по {fmt_dt(en)} ({fmt_dur(dt)})")
+        for e in events:
+            total_dur += e["dur"]
+            cause = ("проблема роутера TP-Link (192.168.0.1 не отвечал)"
+                     if e["cause"] == "router"
+                     else "проблема на стороне провайдера (роутер был доступен, интернет отсутствовал)")
+            L.append(f"  Сбой с {fmt_dt(e['start'])} по {fmt_dt(e['end'])} ({fmt_dur(e['dur'])})")
+            L.append(f"    Причина: {cause}.")
         L.append("")
-        L.append(f"Всего сбоев: {len(all_down_long)}. "
-                 f"Общая длительность недоступности: {fmt_dur(total_dur)}.")
-
-    partial = []
-    for n, lst in per_long.items():
-        if lst:
-            for st, en, dt in lst:
-                inside = False
-                for ast, aen, _ in all_down_long:
-                    if ast <= st and en <= aen:
-                        inside = True; break
-                if not inside:
-                    partial.append((n, st, en, dt))
-    if partial:
-        L.append("")
-        L.append("Отдельные ресурсы были недоступны (при работающем интернете в целом):")
-        for n, st, en, dt in partial:
-            host = next(h for (nm, h, p) in TARGETS if nm == n)
-            L.append(f"  {host} — с {fmt_dt(st)} по {fmt_dt(en)} ({fmt_dur(dt)})")
+        n_router = sum(1 for e in events if e["cause"] == "router")
+        n_prov   = sum(1 for e in events if e["cause"] == "provider")
+        L.append(f"Всего сбоев: {len(events)}. "
+                 f"Общая длительность: {fmt_dur(total_dur)}.")
+        L.append(f"  Из них по вине роутера TP-Link: {n_router}.")
+        L.append(f"  Из них по вине провайдера:      {n_prov}.")
 
     L.append("")
     L.append(f"Средняя задержка до внешних ресурсов: {avg_rtt:.0f} мс.")
