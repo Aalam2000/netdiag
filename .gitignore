@@ -5,4 +5,5 @@ heartbeat
 report.txt
 netdiag.log
 # PyCharm / IDEA
-.idea/
+.idea/# Python
+__pycache__/

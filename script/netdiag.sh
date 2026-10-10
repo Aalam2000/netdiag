@@ -25,7 +25,8 @@ case "$CMD" in
     ;;
 
   stop)
-    echo "[*] Остановка..."
+    echo "[*] Строю отчёт и останавливаю..."
+    docker compose exec -T netdiag python /app/netdiag.py report > /dev/null || true
     docker compose stop
     echo "[*] Отчёт готов: ./data/report.txt"
     ;;
@@ -50,7 +51,8 @@ case "$CMD" in
 
   report)
     echo "[*] Строю отчёт по накопленным данным..."
-    docker compose exec -T netdiag python /app/netdiag.py report
+    shift
+    docker compose exec -T netdiag python /app/netdiag.py report "$@"
     ;;
 
   down)
@@ -66,12 +68,13 @@ case "$CMD" in
     echo "Использование: netdiag {start|stop|restart|status|log|raw|report|down|clean}"
     echo ""
     echo "  start    — запустить мониторинг"
-    echo "  stop     — остановить"
+    echo "  stop     — построить отчёт и остановить"
     echo "  restart  — перезапустить"
     echo "  status   — статус контейнера + последние логи"
     echo "  log      — живой лог (Ctrl+C для выхода)"
     echo "  raw      — последние 10 сырых замеров"
     echo "  report   — построить отчёт (не останавливая мониторинг)"
+    echo "             report --since 2026-10-12 --until 2026-10-19 — за период"
     echo "  down     — удалить контейнер (данные остаются)"
     echo "  clean    — удалить контейнер и папку data/"
     exit 1
