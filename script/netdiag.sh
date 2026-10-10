@@ -28,7 +28,7 @@ case "$CMD" in
     echo "[*] Строю отчёт и останавливаю..."
     docker compose exec -T netdiag python /app/netdiag.py report > /dev/null || true
     docker compose stop
-    echo "[*] Отчёт готов: ./data/report.txt"
+    echo "[*] Отчёт готов: ./data/report.txt и ./data/report.html (графики)"
     ;;
 
   restart)
@@ -53,6 +53,7 @@ case "$CMD" in
     echo "[*] Строю отчёт по накопленным данным..."
     shift
     docker compose exec -T netdiag python /app/netdiag.py report "$@"
+    echo "[*] Графики: $PROJECT_DIR/data/report.html — скопируй и открой в браузере"
     ;;
 
   down)
