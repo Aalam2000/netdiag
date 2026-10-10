@@ -60,12 +60,19 @@ DNS_PROBE_NAME = "google.com"    # какое имя спрашиваем у DNS
 
 INTERVAL_SEC   = 5       # период опроса
 TCP_TIMEOUT    = 2.0     # таймаут одной проверки
+DNS_TRIES      = 2       # попыток DNS-запроса за замер (как у обычного клиента)
+SLOW_FACTOR    = 3       # «медленный» замер: задержка наружу в 3+ раза выше
+SLOW_MIN_MS    = 100     # обычной и не меньше чем на 100 мс
 CYCLE_BUDGET   = 3.5     # предел на весь цикл (зависший DNS не тормозит замеры)
 OUTAGE_MIN_SEC = 30      # от какой длительности событие попадает в список
 MERGE_SEC      = 30      # события с паузой короче этой склеиваются в одно
 GAP_SEC        = 60      # пауза между замерами дольше этой = сервер не работал
 
-DEVICE_SCAN        = True
+# Подсчёт устройств по ARP выключен: с проводного сервера видна лишь малая
+# часть Wi-Fi-клиентов (на замере 10.10.26 — 7 из 40+), цифра вводит в
+# заблуждение. USE_DEVICE_COUNT=False — отчёт игнорирует уже записанные "dev".
+DEVICE_SCAN        = False
+USE_DEVICE_COUNT   = False
 DEVICE_SCAN_SEC    = 60  # как часто считать устройства
 DEVICE_SETTLE_SEC  = 12  # сколько ждать ответов после рассылки
 DEVICE_BUCKETS     = [(0, 20), (21, 40), (41, 60), (61, 80), (81, None)]
@@ -139,7 +146,24 @@ def tcp_check(host, port, timeout=TCP_TIMEOUT):
         s.close()
 
 
-def dns_check(host, port, name=DNS_PROBE_NAME, timeout=TCP_TIMEOUT):
+def dns_check(host, port, name=DNS_PROBE_NAME, timeout=TCP_TIMEOUT,
+              tries=DNS_TRIES):
+    """DNS-запрос с повтором. В записи остаётся, сколько попыток было
+    сделано (tries) и сколько из них осталось без ответа (lost): одиночная
+    потеря — показатель качества, отказом считается потеря всех попыток."""
+    lost = 0
+    d = None
+    for i in range(tries):
+        d = _dns_once(host, port, name, timeout / tries)
+        if d["ok"]:
+            break
+        lost += 1
+    d["tries"] = i + 1
+    d["lost"] = lost
+    return d
+
+
+def _dns_once(host, port, name, timeout):
     """Настоящий DNS-запрос (UDP, запись A) к указанному серверу."""
     qid = random.randint(0, 0xFFFF)
     q = struct.pack(">HHHHHH", qid, 0x0100, 1, 0, 0, 0)
@@ -355,12 +379,15 @@ def classify(data, rdns_trusted=True):
     gw_seen = False
     gw_rtt = None
     rdns = None
+    dns_try = dns_lost = 0
     ext_total = ext_ok = ip_total = ip_ok = name_total = name_ok = 0
     ext_rtts = []
     for n, d in data.items():
         ok = bool(d.get("ok"))
         if n == "gw_dns":
             rdns = ok
+            dns_try = d.get("tries", 1)
+            dns_lost = d.get("lost", 0 if ok else 1)
         elif n.startswith("gw_"):
             gw_seen = True
             if ok:
@@ -398,14 +425,16 @@ def classify(data, rdns_trusted=True):
         state = "ok"
     return {
         "state": state, "gw_ok": gw_ok, "gw_rtt": gw_rtt, "rdns": rdns,
+        "dns_try": dns_try, "dns_lost": dns_lost,
         "ext_rtt": statistics.median(ext_rtts) if ext_rtts else None,
     }
 
 
 def _stat():
     return {"n": 0, "bad": 0, "sec": 0.0, "black_sec": 0.0,
-            "rtt": array("f"), "dev_sum": 0, "dev_n": 0, "dev_max": 0,
-            "outages": 0}
+            "rtt": array("f"), "ext": array("f"),
+            "dns_try": 0, "dns_lost": 0,
+            "dev_sum": 0, "dev_n": 0, "dev_max": 0, "outages": 0}
 
 
 def bucket_of(dev):
@@ -432,7 +461,6 @@ class Analyzer:
         self.wd = defaultdict(_stat)
         self.day = defaultdict(_stat)
         self.bucket = defaultdict(_stat)
-        self.ext_rtt = array("f")
         self.events = []
         self.cur = None
         self.pre = deque(maxlen=60)       # RTT роутера за ~5 минут до события
@@ -471,8 +499,6 @@ class Analyzer:
         ts, state, dev = c["ts"], c["state"], c["dev"]
         if dev is not None:
             self.last_dev = dev
-        if c["ext_rtt"] is not None:
-            self.ext_rtt.append(c["ext_rtt"])
         groups = [self.total, self.hour[ts.hour], self.wd[ts.weekday()],
                   self.day[ts.date()]]
         if dev is not None:
@@ -486,6 +512,11 @@ class Analyzer:
                 s["black_sec"] += dt
             if c["gw_rtt"] is not None:
                 s["rtt"].append(c["gw_rtt"])
+            if c["ext_rtt"] is not None:
+                s["ext"].append(c["ext_rtt"])
+            if state != "blackout":      # при обрыве DNS молчит закономерно
+                s["dns_try"] += c["dns_try"]
+                s["dns_lost"] += c["dns_lost"]
             if dev is not None:
                 s["dev_sum"] += dev
                 s["dev_n"] += 1
@@ -595,10 +626,21 @@ def table(headers, rows):
     return [line(headers), "  " + "  ".join("-" * x for x in w)] + [line(r) for r in rows]
 
 
-def stat_row(label, s, with_dev):
+def slow_share(s, thr):
+    """Доля замеров (в %), где задержка наружу не ниже порога thr."""
+    if thr is None or not s["ext"]:
+        return 0.0
+    return pct(sum(1 for x in s["ext"] if x >= thr), len(s["ext"]))
+
+
+def stat_row(label, s, with_dev, thr=None, with_dns=False):
     row = [label, str(s["n"]), f"{pct(s['bad'], s['n']):.2f}",
            f"{pct(s['black_sec'], s['sec']):.2f}",
-           ms(quantile(s["rtt"], 0.5)), ms(quantile(s["rtt"], 0.95))]
+           ms(quantile(s["rtt"], 0.5)), ms(quantile(s["rtt"], 0.95)),
+           ms(quantile(s["ext"], 0.5)), ms(quantile(s["ext"], 0.95)),
+           f"{slow_share(s, thr):.2f}"]
+    if with_dns:
+        row.append(f"{pct(s['dns_lost'], s['dns_try']):.2f}" if s["dns_try"] else "—")
     if with_dev:
         row.append(f"{s['dev_sum'] / s['dev_n']:.0f}" if s["dev_n"] else "—")
     row.append(str(s["outages"]))
@@ -635,6 +677,10 @@ def render(A):
     T = A.total
     base = quantile(T["rtt"], 0.5)
     with_dev = T["dev_n"] > 0
+    with_dns = A.has_rdns
+    ext_base = quantile(T["ext"], 0.5)
+    thr = (max(SLOW_FACTOR * ext_base, ext_base + SLOW_MIN_MS)
+           if ext_base is not None else None)
 
     outages = [e for e in A.events if e["kind"] == "outage"]
     blips = [e for e in A.events if e["kind"] == "blip"]
@@ -670,8 +716,8 @@ def render(A):
         L.append(f"  Раз в {DEVICE_SCAN_SEC} сек считалось число устройств в сети {LAN_NET}")
         L.append("  (по ответам на ARP; в число входят и сами роутеры).")
     else:
-        L.append("  Число устройств в сети в этих данных не записано (старая версия")
-        L.append("  сборщика) — нагрузка оценивается только по времени суток.")
+        L.append("  Число устройств с сервера достоверно не определяется (Wi-Fi-клиенты")
+        L.append("  ему почти не видны) — нагрузка оценивается по времени суток.")
     L.append("")
 
     if A.gaps:
@@ -706,27 +752,41 @@ def render(A):
     L += wrap(f"Ответ роутера по локальной сети: обычно {ms(base)} мс, "
               f"в 5% худших замеров от {ms(quantile(T['rtt'], 0.95))} мс, "
               f"максимум {ms(max(T['rtt']) if T['rtt'] else None)} мс.", 76, "  ", "    ")
-    L += wrap(f"Задержка до внешних ресурсов: обычно {ms(quantile(A.ext_rtt, 0.5))} мс, "
-              f"в 5% худших замеров от {ms(quantile(A.ext_rtt, 0.95))} мс.", 76, "  ", "    ")
+    L += wrap(f"Задержка до внешних ресурсов: обычно {ms(ext_base)} мс, "
+              f"в 5% худших замеров от {ms(quantile(T['ext'], 0.95))} мс, "
+              f"максимум {ms(max(T['ext']) if T['ext'] else None)} мс.", 76, "  ", "    ")
+    if thr is not None:
+        n_slow = sum(1 for x in T["ext"] if x >= thr)
+        L += wrap(f"Медленных замеров (задержка наружу от {thr:.0f} мс): "
+                  f"{n_slow} из {len(T['ext'])} ({pct(n_slow, len(T['ext'])):.2f}%).",
+                  76, "  ", "    ")
+    if with_dns:
+        L += wrap(f"DNS роутера: без ответа {T['dns_lost']} из {T['dns_try']} "
+                  f"запросов ({pct(T['dns_lost'], T['dns_try']):.2f}%).", 76, "  ", "    ")
     if A.rdns_n and not A.rdns_ok:
         L.append(f"  DNS роутера ({GATEWAY}:53) не ответил ни разу — вероятно, он")
         L.append("  выключен; эта проверка в отчёте не учитывается.")
     L.append("")
 
-    head = ["", "замеров", "отклон.,%", "обрыв,%", "роутер,мс", "95%,мс"]
+    head = ["", "замеров", "отклон.,%", "обрыв,%", "роутер,мс", "95%,мс",
+            "наружу,мс", "95%,мс", "медл.,%"]
+    if with_dns:
+        head.append("DNS пот.,%")
     if with_dev:
         head.append("устройств")
     head.append("обрывов")
     legend = [
         "  отклон. — доля замеров с любым отклонением; обрыв — доля времени без",
         "  интернета; роутер — обычная задержка ответа роутера по локальной сети",
-        "  и граница 5% худших замеров; обрывов — число полных обрывов.",
+        "  и граница 5% худших замеров; наружу — то же до внешних ресурсов;",
+        "  медл. — доля медленных замеров; DNS пот. — доля DNS-запросов к",
+        "  роутеру, оставшихся без ответа; обрывов — число полных обрывов.",
     ]
 
     # ---------- по числу устройств ----------
     if with_dev:
         L.append("ЗАВИСИМОСТЬ ОТ ЧИСЛА УСТРОЙСТВ В СЕТИ")
-        rows = [stat_row(bucket_label(i), A.bucket[i], True)
+        rows = [stat_row(bucket_label(i), A.bucket[i], True, thr, with_dns)
                 for i in range(len(DEVICE_BUCKETS)) if A.bucket[i]["n"]]
         L += table(["устройств"] + head[1:], rows)
         L += legend
@@ -734,7 +794,7 @@ def render(A):
 
     # ---------- по часам ----------
     L.append("ПО ЧАСАМ СУТОК")
-    rows = [stat_row(f"{h:02d}:00", A.hour[h], with_dev)
+    rows = [stat_row(f"{h:02d}:00", A.hour[h], with_dev, thr, with_dns)
             for h in range(24) if A.hour[h]["n"]]
     L += table(["час"] + head[1:], rows)
     if not with_dev:
@@ -742,7 +802,7 @@ def render(A):
     L.append("")
 
     L.append("ПО ДНЯМ НЕДЕЛИ")
-    rows = [stat_row(WD_NAMES[d], A.wd[d], with_dev)
+    rows = [stat_row(WD_NAMES[d], A.wd[d], with_dev, thr, with_dns)
             for d in range(7) if A.wd[d]["n"]]
     L += table(["день"] + head[1:], rows)
     L.append("")
@@ -835,17 +895,24 @@ def render(A):
             C.append("Данных о числе устройств пока недостаточно для сравнения "
                      "(нужен хотя бы час наблюдений при малой и при большой "
                      "нагрузке).")
+
     else:
         work, off = _stat(), _stat()
         for h in range(24):
             dst = work if WORK_HOURS[0] <= h < WORK_HOURS[1] else off
-            for k in ("n", "bad", "sec", "black_sec", "outages"):
+            for k in ("n", "bad", "sec", "black_sec", "outages",
+                      "dns_try", "dns_lost"):
                 dst[k] += A.hour[h][k]
             dst["rtt"].extend(A.hour[h]["rtt"])
+            dst["ext"].extend(A.hour[h]["ext"])
         if work["n"] >= MIN_N and off["n"] >= MIN_N:
             lo, hi = off, work
             lo_name = "в остальное время"
             hi_name = f"с {WORK_HOURS[0]:02d}:00 до {WORK_HOURS[1]:02d}:00"
+        else:
+            C.append(f"Для сравнения нагрузки нужны данные и за рабочие часы "
+                     f"({WORK_HOURS[0]:02d}:00–{WORK_HOURS[1]:02d}:00), и за "
+                     f"нерабочие — не меньше часа каждого. Пока их недостаточно.")
     if lo is not None:
         p_lo, p_hi = pct(lo["bad"], lo["n"]), pct(hi["bad"], hi["n"])
         r_lo, r_hi = quantile(lo["rtt"], 0.5), quantile(hi["rtt"], 0.5)
@@ -859,11 +926,24 @@ def render(A):
         else:
             C.append("Зависимости сбоев от нагрузки не видно: " + facts + ". "
                      "Эти данные не подтверждают, что роутер не справляется "
-                     "с числом устройств.")
+                     "с нагрузкой.")
         if r_lo and r_hi and r_hi >= max(2 * r_lo, r_lo + 5):
             C.append(f"Роутер под нагрузкой отвечает медленнее: обычная задержка "
                      f"по локальной сети {r_hi:.0f} мс {hi_name} против "
                      f"{r_lo:.0f} мс {lo_name}.")
+        s_lo, s_hi = slow_share(lo, thr), slow_share(hi, thr)
+        if s_hi >= 0.5 and s_hi >= 3 * max(s_lo, 0.05):
+            C.append(f"Под нагрузкой интернет замедляется: медленных замеров "
+                     f"{s_hi:.2f}% {hi_name} против {s_lo:.2f}% {lo_name}.")
+        if with_dns and lo["dns_try"] >= MIN_N and hi["dns_try"] >= MIN_N:
+            d_lo = pct(lo["dns_lost"], lo["dns_try"])
+            d_hi = pct(hi["dns_lost"], hi["dns_try"])
+            if d_hi >= 0.5 and d_hi >= 3 * max(d_lo, 0.05):
+                C.append(f"DNS роутера под нагрузкой теряет запросы чаще: "
+                         f"{d_hi:.2f}% {hi_name} против {d_lo:.2f}% {lo_name}.")
+            else:
+                C.append(f"Потери DNS роутера от нагрузки не зависят: "
+                         f"{d_hi:.2f}% {hi_name} и {d_lo:.2f}% {lo_name}.")
     if n_unknown:
         C.append(f"{plural(n_unknown, 'обрыв', 'обрыва', 'обрывов')} этим замером нельзя отнести ни к роутеру, "
                  "ни к провайдеру: роутер отвечал нормально, а трафик наружу не "
@@ -910,7 +990,7 @@ def build_report(since=None, until=None):
                     continue
                 if (since and ts < since) or (until and ts >= until):
                     continue
-                A.feed(ts, data, r.get("dev"))
+                A.feed(ts, data, r.get("dev") if USE_DEVICE_COUNT else None)
     A.finish()
     txt = render(A) if A.first is not None else "Отчёт пуст: нет данных.\n"
     with open(OUT_REPORT, "w", encoding="utf-8") as f:
