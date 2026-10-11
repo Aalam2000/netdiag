@@ -447,6 +447,7 @@ def _stat():
     return {"n": 0, "bad": 0, "sec": 0.0, "black_sec": 0.0,
             "rtt": array("f"), "ext": array("f"),
             "dns_try": 0, "dns_lost": 0, "ctl_try": 0, "ctl_lost": 0,
+            "dnsc_try": 0, "dnsc_lost": 0,   # DNS роутера там, где есть контроль
             "dev_sum": 0, "dev_n": 0, "dev_max": 0, "outages": 0}
 
 
@@ -533,6 +534,9 @@ class Analyzer:
                 s["dns_lost"] += c["dns_lost"]
                 s["ctl_try"] += c["ctl_try"]
                 s["ctl_lost"] += c["ctl_lost"]
+                if c["ctl_try"]:
+                    s["dnsc_try"] += c["dns_try"]
+                    s["dnsc_lost"] += c["dns_lost"]
             if dev is not None:
                 s["dev_sum"] += dev
                 s["dev_n"] += 1
@@ -677,8 +681,9 @@ def outage_verdict(e, base):
     slow = (rtt is not None and base is not None
             and rtt >= max(3 * base, base + 20))
     if share_down >= 0.5:
-        return "router", ("роутер не отвечал и по локальной сети — "
-                          "неисправность на стороне роутера")
+        return "router", ("роутер не отвечал и по локальной сети — он завис "
+                          "или перезагрузился. Проверить: время работы (uptime) "
+                          "и журнал в интерфейсе роутера")
     if slow or e["gw_down"] > 0:
         why = []
         if slow:
@@ -864,7 +869,8 @@ def render(A):
         L.append("ПОЛНЫЕ ОБРЫВЫ ИНТЕРНЕТА")
         for e in outages[:MAX_EVENTS_LISTED]:
             L.append(f"  {fmt_dt(e['start'])} — {fmt_dt(e['end'])} "
-                     f"({fmt_dur(e['dur'])}{dev_txt(e)})")
+                     f"({fmt_dur(e['dur'])}, из них без интернета "
+                     f"{fmt_dur(e['sec']['blackout'])}{dev_txt(e)})")
             L += wrap(e["text"][0].upper() + e["text"][1:] + ".", 76, "    ", "    ")
         if len(outages) > MAX_EVENTS_LISTED:
             L.append(f"  ... и ещё {len(outages) - MAX_EVENTS_LISTED}.")
@@ -899,7 +905,8 @@ def render(A):
                  "замер не видит.")
     dns_sure = [e for e in dns_ev
                 if A.has_rdns and e["ctl_try"] and e["ctl_lost"] == 0]
-    dns_open = [e for e in dns_ev if e not in dns_sure]
+    dns_chan = [e for e in dns_ev if e["ctl_try"] and e["ctl_lost"] > 0]
+    dns_open = [e for e in dns_ev if not e["ctl_try"]]
     certain = n_router + len(mute_ev) + len(dns_sure)
     if certain:
         bits = []
@@ -916,22 +923,35 @@ def render(A):
                         "запросы при работающем интернете")
         C.append(f"Событий, которые относятся к роутеру однозначно: {certain} ("
                  + "; ".join(bits) + ").")
+    if dns_chan:
+        C.append(f"Отказов DNS, при которых не отвечал и контрольный запрос "
+                 f"мимо роутера: {len(dns_chan)}. В эти моменты сбоил канал "
+                 "целиком, а не только DNS роутера: причина в роутере как "
+                 "маршрутизаторе или у провайдера.")
     if dns_open:
         C.append(f"Отказов DNS роутера без контрольного замера: {len(dns_open)}. "
                  "Канал по IP в это время работал, но роутер пересылает "
                  "DNS-запросы серверу провайдера, поэтому по этим случаям "
                  "нельзя исключить, что не отвечал он, а не роутер.")
-    if with_ctl and T["dns_try"]:
-        d_r = pct(T["dns_lost"], T["dns_try"])
+    if with_ctl and T["dnsc_try"]:
+        # сравниваем только те замеры, где работали обе проверки
+        d_r = pct(T["dnsc_lost"], T["dnsc_try"])
         d_c = pct(T["ctl_lost"], T["ctl_try"])
+        scope = (f"За время, когда работали обе проверки "
+                 f"({T['dnsc_try']} запросов к роутеру и {T['ctl_try']} мимо него), ")
         if d_r >= 0.3 and d_r >= 3 * max(d_c, 0.05):
-            C.append(f"DNS роутера теряет запросы ({d_r:.2f}%), а тот же запрос "
-                     f"мимо роутера проходит ({d_c:.2f}% потерь). Канал исправен, "
+            C.append(scope + f"DNS роутера не ответил на {d_r:.2f}% запросов, "
+                     f"а запрос мимо роутера — на {d_c:.2f}%. Канал исправен, "
                      "потери возникают в роутере или у DNS-сервера, которому он "
                      "пересылает запросы.")
         elif d_c >= 0.3:
-            C.append(f"DNS-запросы теряются и через роутер ({d_r:.2f}%), и мимо "
-                     f"него ({d_c:.2f}%): причина в канале, а не в DNS роутера.")
+            C.append(scope + f"без ответа остались {d_r:.2f}% запросов к DNS "
+                     f"роутера и {d_c:.2f}% запросов мимо него. Теряются и те, "
+                     "и другие: причина в канале, а не в DNS роутера.")
+        else:
+            C.append(scope + f"потери малы и одинаковы: {d_r:.2f}% у DNS роутера "
+                     f"и {d_c:.2f}% мимо него. Часы с высокой нагрузкой в это "
+                     "сравнение могли ещё не попасть.")
     if n_load:
         C.append(f"Ещё {plural(n_load, 'обрыв сопровождался', 'обрыва сопровождались', 'обрывов сопровождались')} "
                  "замедлением или перебоями "
@@ -957,7 +977,8 @@ def render(A):
         for h in range(24):
             dst = work if WORK_HOURS[0] <= h < WORK_HOURS[1] else off
             for k in ("n", "bad", "sec", "black_sec", "outages",
-                      "dns_try", "dns_lost", "ctl_try", "ctl_lost"):
+                      "dns_try", "dns_lost", "ctl_try", "ctl_lost",
+                      "dnsc_try", "dnsc_lost"):
                 dst[k] += A.hour[h][k]
             dst["rtt"].extend(A.hour[h]["rtt"])
             dst["ext"].extend(A.hour[h]["ext"])
@@ -1008,6 +1029,7 @@ def render(A):
                  "сбоя посмотреть статус WAN в интерфейсе роутера.")
     if not C:
         C.append("Отклонения единичные; оснований для выводов о причине нет.")
+    A.conclusions = C
     for i, c in enumerate(C, 1):
         L += wrap(f"{i}. {c}", 76, "  ", "     ")
     L.append("")
@@ -1159,7 +1181,10 @@ def render_html(A, text_report):
                     f"Контрольный DNS тоже терял запросы ({e['ctl_lost']} из {e['ctl_try']})")
         events.append({
             "a": round(pos(e["start"]), 3), "b": round(pos(e["end"]), 3),
-            "start": fmt_dt(e["start"]), "dur": fmt_dur(e["dur"]),
+            "start": fmt_dt(e["start"]),
+            "dur": fmt_dur(e["dur"]) + (
+                f" (без интернета {fmt_dur(e['sec']['blackout'])})"
+                if e["kind"] == "outage" else ""),
             "kind": EVENT_KINDS[e["kind"]],
             "note": (note[:1].upper() + note[1:]) if note else "",
         })
@@ -1183,9 +1208,7 @@ def render_html(A, text_report):
         tiles.append({
             "k": "DNS роутера: без ответа",
             "v": f"{pct(T['dns_lost'], T['dns_try']):.2f}%".replace(".", ","),
-            "s": (f"контроль мимо роутера: "
-                  f"{pct(T['ctl_lost'], T['ctl_try']):.2f}%".replace(".", ",")
-                  if T["ctl_try"] else f"{T['dns_lost']} из {T['dns_try']} запросов")})
+            "s": f"{T['dns_lost']} из {T['dns_try']} запросов"})
     if thr is not None:
         n_slow = sum(1 for x in T["ext"] if x >= thr)
         tiles.append({"k": "Медленных замеров",
@@ -1224,6 +1247,7 @@ def render_html(A, text_report):
         "step": (f"{step_min} мин" if step_min < 60 else f"{step_min // 60} ч"),
         "points": points, "ticks": ticks, "events": events, "gaps": gaps,
         "tiles": tiles, "charts": charts,
+        "conclusions": getattr(A, "conclusions", []),
     }
     blob = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
     return (HTML_TEMPLATE
@@ -1295,13 +1319,16 @@ table { border-collapse: collapse; width: 100%; font-size: 13px; }
 th, td { text-align: left; padding: 6px 10px 6px 0; border-bottom: 1px solid var(--border);
   vertical-align: top; }
 th { color: var(--text2); font-weight: 500; font-size: 12px; }
-td.num { white-space: nowrap; font-variant-numeric: tabular-nums; }
+td.num { font-variant-numeric: tabular-nums; }
+td.num:first-child { white-space: nowrap; }
 .scroll { overflow-x: auto; }
 details { margin-top: 14px; }
 summary { cursor: pointer; color: var(--text2); }
 pre { background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
   padding: 14px; overflow-x: auto; font-size: 12px; line-height: 1.4; }
 .empty { color: var(--text2); padding: 4px 0 8px; }
+ol { margin: 8px 0 6px; padding-left: 22px; max-width: 860px; }
+ol li { margin-bottom: 6px; }
 </style>
 </head>
 <body>
@@ -1309,6 +1336,10 @@ pre { background: var(--surface); border: 1px solid var(--border); border-radius
   <h1>NetDiag — отчёт</h1>
   <p class="sub" id="sub"></p>
   <div class="tiles" id="tiles"></div>
+  <div class="card" id="concl-card">
+    <h2>Что из этого следует</h2>
+    <ol id="concl"></ol>
+  </div>
   <div class="key">
     <span><i class="sw ev"></i>красная полоса — событие из списка ниже</span>
     <span><i class="sw gp"></i>серая полоса — сервер не работал, замеров нет</span>
@@ -1359,6 +1390,9 @@ pre { background: var(--surface); border: 1px solid var(--border); border-radius
     'Период: ' + D.period + ' · наблюдение ' + D.observed + ' · замеров: ' + D.samples;
   document.getElementById('stepnote').textContent = 'одна точка графика = ' + D.step;
   var tiles = document.getElementById('tiles');
+  var cl = document.getElementById('concl');
+  (D.conclusions || []).forEach(function (t) { h('li', null, t, cl); });
+  if (!(D.conclusions || []).length) document.getElementById('concl-card').style.display = 'none';
   D.tiles.forEach(function (t) {
     var d = h('div', 'tile', null, tiles);
     h('div', 'k', t.k, d); h('div', 'v', t.v, d); h('div', 's', t.s, d);
