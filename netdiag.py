@@ -15,6 +15,7 @@ NetDiag — мониторинг роутера и интернета с про�
 Раз в DEVICE_SCAN_SEC секунд считается число устройств в локальной сети —
 это объективная мера нагрузки, с которой сопоставляются сбои.
 """
+import fcntl
 import ipaddress
 import json
 import logging
@@ -76,14 +77,14 @@ OUTAGE_MIN_SEC = 30      # от какой длительности событи
 MERGE_SEC      = 30      # события с паузой короче этой склеиваются в одно
 GAP_SEC        = 60      # пауза между замерами дольше этой = сервер не работал
 
-# Подсчёт устройств по ARP выключен: с проводного сервера видна лишь малая
-# часть Wi-Fi-клиентов (на замере 10.10.26 — 7 из 40+), цифра вводит в
-# заблуждение. USE_DEVICE_COUNT=False — отчёт игнорирует уже записанные "dev".
-DEVICE_SCAN        = False
-USE_DEVICE_COUNT   = False
+# Подсчёт устройств: сервер сам рассылает ARP-запросы по всей подсети
+# (как arp-scan) и считает ответившие MAC-адреса. В число входят серверы и
+# роутеры — это постоянный «ночной» уровень; всё, что выше, — люди.
+DEVICE_SCAN        = True
+USE_DEVICE_COUNT   = True
 DEVICE_SCAN_SEC    = 60  # как часто считать устройства
-DEVICE_SETTLE_SEC  = 12  # сколько ждать ответов после рассылки
-DEVICE_BUCKETS     = [(0, 20), (21, 40), (41, 60), (61, 80), (81, None)]
+DEVICE_ROUNDS      = 3   # сколько раз повторять рассылку за один подсчёт
+DEVICE_BUCKETS     = [(0, 30), (31, 45), (46, 60), (61, 80), (81, None)]
 
 WORK_HOURS = (9, 21)     # используется, только если нет данных о числе устройств
 MAX_EVENTS_LISTED = 150
@@ -250,64 +251,115 @@ def sample_all():
 _dev = {"n": None, "t": 0.0}
 
 
-def _arp_count():
+def _lan_iface():
+    """Интерфейс сервера, адрес которого лежит в LAN_NET: (имя, ip, mac)."""
     net = ipaddress.ip_network(LAN_NET)
-    n = 0
-    with open("/proc/net/arp") as f:
-        next(f, None)
-        for line in f:
-            p = line.split()
-            if len(p) < 4 or p[2] == "0x0" or p[3] == "00:00:00:00:00:00":
-                continue
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        for _idx, name in socket.if_nameindex():
+            ifr = struct.pack("256s", name.encode()[:15])
             try:
-                if ipaddress.ip_address(p[0]) in net:
-                    n += 1
-            except ValueError:
-                pass
-    return n
+                ip = socket.inet_ntoa(fcntl.ioctl(probe.fileno(), 0x8915, ifr)[20:24])
+                if ipaddress.ip_address(ip) not in net:
+                    continue
+                mac = fcntl.ioctl(probe.fileno(), 0x8927, ifr)[18:24]
+                return name, ip, mac
+            except OSError:
+                continue
+    finally:
+        probe.close()
+    return None
+
+
+def arp_scan(iface, my_ip, my_mac, rounds=DEVICE_ROUNDS):
+    """Рассылает ARP-запросы на все адреса LAN_NET и возвращает {ip: mac}
+    ответивших. Запросы повторяются: устройства на Wi-Fi отвечают не сразу."""
+    net = ipaddress.ip_network(LAN_NET)
+    hosts = [h for h in net.hosts() if str(h) != my_ip]
+    spa = socket.inet_aton(my_ip)
+    head = (b"\xff" * 6 + my_mac + b"\x08\x06"
+            + struct.pack(">HHBBH", 1, 0x0800, 6, 4, 1) + my_mac + spa + b"\x00" * 6)
+    found = {}
+    s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0806))
+    try:
+        s.bind((iface, 0))
+
+        def listen(sec):
+            end = time.monotonic() + sec
+            while True:
+                left = end - time.monotonic()
+                if left <= 0:
+                    return
+                s.settimeout(left)
+                try:
+                    pkt = s.recv(128)
+                except socket.timeout:
+                    return
+                except OSError:
+                    return
+                if len(pkt) < 42 or pkt[12:14] != b"\x08\x06" or pkt[20:22] != b"\x00\x02":
+                    continue
+                ip = socket.inet_ntoa(pkt[28:32])
+                if ip != my_ip and ipaddress.ip_address(ip) in net:
+                    found[ip] = pkt[22:28]
+
+        for _ in range(rounds):
+            for h in hosts:
+                if str(h) in found:
+                    continue
+                try:
+                    s.send(head + h.packed)
+                except OSError:
+                    pass
+                listen(0.004)
+            listen(1.5)
+    finally:
+        s.close()
+    return found
 
 
 def device_scanner():
-    """Раз в DEVICE_SCAN_SEC шлёт по одному пустому UDP-пакету на каждый адрес
-    сети (порт 9, discard). Это заставляет ядро выполнить ARP-запрос; кто
-    ответил — тот в сети. Затем считаем живые записи ARP-таблицы."""
+    """Раз в DEVICE_SCAN_SEC считает устройства в локальной сети по ARP."""
     try:
-        hosts = [str(h) for h in ipaddress.ip_network(LAN_NET).hosts()]
+        n_hosts = ipaddress.ip_network(LAN_NET).num_addresses
     except Exception as e:
         log.warning("device scan disabled: bad LAN_NET (%s)", e)
         return
-    if len(hosts) > 1024 or not os.path.exists("/proc/net/arp"):
-        log.warning("device scan disabled (net too large or no /proc/net/arp)")
+    if n_hosts > 1024:
+        log.warning("device scan disabled: сеть %s слишком велика", LAN_NET)
         return
-    warned = False
+    try:
+        me = _lan_iface()
+    except Exception as e:
+        me = None
+        log.warning("device scan: не удалось определить интерфейс (%s)", e)
+    if me is None:
+        log.warning("device scan disabled: у сервера нет адреса в %s", LAN_NET)
+        return
+    iface, my_ip, my_mac = me
+    log.info("device scan: %s %s, сеть %s", iface, my_ip, LAN_NET)
+    failures = 0
     while not _stop:
         t0 = time.time()
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.setblocking(False)
-            for h in hosts:
-                try:
-                    s.sendto(b"\x00", (h, 9))
-                except OSError:
-                    pass
-                time.sleep(0.005)
-            s.close()
-            time.sleep(DEVICE_SETTLE_SEC)
-            n = _arp_count()
-            _dev["n"] = n
+            found = arp_scan(iface, my_ip, my_mac)
+            _dev["n"] = len(found)
             _dev["t"] = time.time()
-            if n <= 1 and not warned:
-                log.warning("device scan sees %d devices — проверь LAN_NET", n)
-                warned = True
+            failures = 0
+        except PermissionError:
+            log.warning("device scan disabled: нет прав на ARP "
+                        "(нужен root и cap NET_RAW в контейнере)")
+            return
         except Exception as e:
-            log.warning("device scan failed: %s", e)
+            failures += 1
+            if failures <= 3:
+                log.warning("device scan failed: %s", e)
         while not _stop and time.time() - t0 < DEVICE_SCAN_SEC:
             time.sleep(1)
 
 
 def current_devices():
-    if (_dev["n"] is None or _dev["n"] <= 1
-            or time.time() - _dev["t"] > DEVICE_SCAN_SEC * 3):
+    if _dev["n"] is None or time.time() - _dev["t"] > DEVICE_SCAN_SEC * 3:
         return None
     return _dev["n"]
 
@@ -351,7 +403,7 @@ def run():
                    "data": sample_all()}
             dev = current_devices()
             if dev is not None:
-                rec["dev"] = dev
+                rec["ndev"] = dev
             f.write(json.dumps(rec) + "\n")
             f.flush()
             os.fsync(f.fileno())
@@ -600,17 +652,27 @@ def fmt_dt(dt):
     return dt.strftime("%d.%m.%y %H:%M:%S")
 
 
-def fmt_dur(sec):
+DUR_UNITS = {"ru": ("сут", "ч", "мин", "сек"),
+             "az": ("gün", "saat", "dəq", "san")}
+
+
+def fmt_dur(sec, lang="ru"):
+    ud, uh, um, us = DUR_UNITS[lang]
     sec = int(round(sec))
     d, sec = divmod(sec, 86400)
     h, sec = divmod(sec, 3600)
     m, s = divmod(sec, 60)
     parts = []
-    if d: parts.append(f"{d} сут")
-    if h: parts.append(f"{h} ч")
-    if m: parts.append(f"{m} мин")
-    if (s and not d) or not parts: parts.append(f"{s} сек")
+    if d: parts.append(f"{d} {ud}")
+    if h: parts.append(f"{h} {uh}")
+    if m: parts.append(f"{m} {um}")
+    if (s and not d) or not parts: parts.append(f"{s} {us}")
     return " ".join(parts)
+
+
+def both(fn):
+    """Одно и то же значение на двух языках HTML-отчёта."""
+    return {"ru": fn("ru"), "az": fn("az")}
 
 
 def plural(n, one, few, many):
@@ -681,21 +743,35 @@ def outage_verdict(e, base):
     slow = (rtt is not None and base is not None
             and rtt >= max(3 * base, base + 20))
     if share_down >= 0.5:
-        return "router", ("роутер не отвечал и по локальной сети — он завис "
-                          "или перезагрузился. Проверить: время работы (uptime) "
-                          "и журнал в интерфейсе роутера")
+        return ("router",
+                "роутер не отвечал и по локальной сети — он завис "
+                "или перезагрузился. Проверить: время работы (uptime) "
+                "и журнал в интерфейсе роутера",
+                "router lokal şəbəkədə də cavab vermirdi — donub və ya "
+                "yenidən yüklənib. Yoxlamaq lazımdır: routerin interfeysində "
+                "iş vaxtı (uptime) və jurnal")
     if slow or e["gw_down"] > 0:
-        why = []
+        why, why_az = [], []
         if slow:
             why.append(f"отвечал по локальной сети за {rtt:.0f} мс "
                        f"при обычных {base:.0f} мс")
+            why_az.append(f"lokal şəbəkədə {rtt:.0f} ms gecikmə ilə cavab "
+                          f"verirdi (adətən {base:.0f} ms)")
         if e["gw_down"] > 0:
             why.append(f"не ответил на {e['gw_down']} из {e['n']} локальных запросов")
-        return "router_load", ("роутер " + ", ".join(why) +
-                               " — признак перегрузки роутера")
-    return "unknown", ("роутер отвечал по локальной сети нормально, трафик "
-                       "наружу не шёл — роутер (NAT/WAN) или провайдер, "
-                       "этим замером не различить")
+            why_az.append(f"{e['n']} lokal sorğudan {e['gw_down']} dənəsi "
+                          "cavabsız qaldı")
+        return ("router_load",
+                "роутер " + ", ".join(why) + " — признак перегрузки роутера",
+                "router " + ", ".join(why_az)
+                + " — routerin həddən artıq yüklənməsinin əlaməti")
+    return ("unknown",
+            "роутер отвечал по локальной сети нормально, трафик "
+            "наружу не шёл — роутер (NAT/WAN) или провайдер, "
+            "этим замером не различить",
+            "router lokal şəbəkədə normal cavab verirdi, lakin trafik xaricə "
+            "getmirdi — router (NAT/WAN) və ya provayder; bu ölçmə ilə ayırd "
+            "etmək mümkün deyil")
 
 
 def render(A):
@@ -715,7 +791,7 @@ def render(A):
                         if e["kind"] == k and e["dur"] >= OUTAGE_MIN_SEC]
     dns_ev, part_ev, mute_ev = longer("dns"), longer("partial"), longer("gwmute")
     for e in outages:
-        e["verdict"], e["text"] = outage_verdict(e, base)
+        e["verdict"], e["text"], e["text_az"] = outage_verdict(e, base)
         st = e["start"]
         groups = [T, A.hour[st.hour], A.wd[st.weekday()], A.day[st.date()]]
         if e["dev"] is not None and with_dev:
@@ -744,10 +820,10 @@ def render(A):
     L.append("      google.com, cloudflare.com, github.com) — идёт ли трафик наружу.")
     if with_dev:
         L.append(f"  Раз в {DEVICE_SCAN_SEC} сек считалось число устройств в сети {LAN_NET}")
-        L.append("  (по ответам на ARP; в число входят и сами роутеры).")
+        L.append("  (по ответам на ARP-запросы сервера; в число входят серверы и роутеры).")
     else:
-        L.append("  Число устройств с сервера достоверно не определяется (Wi-Fi-клиенты")
-        L.append("  ему почти не видны) — нагрузка оценивается по времени суток.")
+        L.append("  Числа устройств в этих данных нет — нагрузка оценивается по")
+        L.append("  времени суток.")
     L.append("")
 
     if A.gaps:
@@ -898,80 +974,118 @@ def render(A):
 
     # ---------- выводы ----------
     L.append("ЧТО ИЗ ЭТОГО СЛЕДУЕТ")
-    C = []
+    C, CA = [], []                    # выводы: по-русски и по-азербайджански
+
+    def say(ru, az):
+        C.append(ru)
+        CA.append(az)
+
     if not A.events and T["bad"] == 0:
-        C.append("По проводу сбоев не зафиксировано. Если жалобы в этот период "
-                 "были, их причина в беспроводной части сети, которую этот "
-                 "замер не видит.")
+        say("По проводу сбоев не зафиксировано. Если жалобы в этот период "
+            "были, их причина в беспроводной части сети, которую этот "
+            "замер не видит.",
+            "Kabel üzrə nasazlıq qeydə alınmayıb. Əgər bu dövrdə şikayətlər "
+            "olubsa, səbəb şəbəkənin simsiz hissəsindədir — bu ölçmə onu görmür.")
     dns_sure = [e for e in dns_ev
                 if A.has_rdns and e["ctl_try"] and e["ctl_lost"] == 0]
     dns_chan = [e for e in dns_ev if e["ctl_try"] and e["ctl_lost"] > 0]
     dns_open = [e for e in dns_ev if not e["ctl_try"]]
     certain = n_router + len(mute_ev) + len(dns_sure)
     if certain:
-        bits = []
+        bits, bits_az = [], []
         if n_router:
             bits.append(f"{n_router} — обрывы, при которых роутер не отвечал "
                         "и по локальной сети")
+            bits_az.append(f"{n_router} — routerin lokal şəbəkədə də cavab "
+                           "vermədiyi kəsilmələr")
         if dns_sure:
             bits.append(f"{len(dns_sure)} — отказы DNS роутера, при которых "
                         "контрольный DNS-запрос мимо роутера проходил "
                         "(для устройств, получающих DNS от роутера, это выглядит "
                         "как пропавший интернет)")
+            bits_az.append(f"{len(dns_sure)} — routerin DNS-i cavab vermədiyi, "
+                           "lakin routerdən yan keçən nəzarət DNS sorğusunun "
+                           "keçdiyi hallar (DNS-i routerdən alan cihazlar üçün "
+                           "bu, internetin itməsi kimi görünür)")
         if mute_ev:
             bits.append(f"{len(mute_ev)} — роутер переставал отвечать на локальные "
                         "запросы при работающем интернете")
-        C.append(f"Событий, которые относятся к роутеру однозначно: {certain} ("
-                 + "; ".join(bits) + ").")
+            bits_az.append(f"{len(mute_ev)} — internet işləyərkən router lokal "
+                           "sorğulara cavab verməyi dayandırıb")
+        say(f"Событий, которые относятся к роутеру однозначно: {certain} ("
+            + "; ".join(bits) + ").",
+            f"Birmənalı olaraq routerə aid hadisələr: {certain} ("
+            + "; ".join(bits_az) + ").")
     if dns_chan:
-        C.append(f"Отказов DNS, при которых не отвечал и контрольный запрос "
-                 f"мимо роутера: {len(dns_chan)}. В эти моменты сбоил канал "
-                 "целиком, а не только DNS роутера: причина в роутере как "
-                 "маршрутизаторе или у провайдера.")
+        say(f"Отказов DNS, при которых не отвечал и контрольный запрос "
+            f"мимо роутера: {len(dns_chan)}. В эти моменты сбоил канал "
+            "целиком, а не только DNS роутера: причина в роутере как "
+            "маршрутизаторе или у провайдера.",
+            f"Routerdən yan keçən nəzarət sorğusunun da cavabsız qaldığı DNS "
+            f"nasazlıqları: {len(dns_chan)}. Bu anlarda təkcə routerin DNS-i "
+            "deyil, bütün kanal nasaz idi: səbəb ya marşrutlaşdırıcı kimi "
+            "routerdə, ya da provayderdədir.")
     if dns_open:
-        C.append(f"Отказов DNS роутера без контрольного замера: {len(dns_open)}. "
-                 "Канал по IP в это время работал, но роутер пересылает "
-                 "DNS-запросы серверу провайдера, поэтому по этим случаям "
-                 "нельзя исключить, что не отвечал он, а не роутер.")
+        say(f"Отказов DNS роутера без контрольного замера: {len(dns_open)}. "
+            "Канал по IP в это время работал, но роутер пересылает "
+            "DNS-запросы серверу провайдера, поэтому по этим случаям "
+            "нельзя исключить, что не отвечал он, а не роутер.",
+            f"Nəzarət ölçməsi olmadan qeydə alınan router DNS nasazlıqları: "
+            f"{len(dns_open)}. Bu vaxt IP üzrə kanal işləyirdi, lakin router "
+            "DNS sorğularını provayderin serverinə ötürür, ona görə də bu "
+            "hallarda cavab verməyənin router deyil, həmin server olduğunu "
+            "istisna etmək olmaz.")
     if with_ctl and T["dnsc_try"]:
         # сравниваем только те замеры, где работали обе проверки
         d_r = pct(T["dnsc_lost"], T["dnsc_try"])
         d_c = pct(T["ctl_lost"], T["ctl_try"])
         scope = (f"За время, когда работали обе проверки "
                  f"({T['dnsc_try']} запросов к роутеру и {T['ctl_try']} мимо него), ")
+        scope_az = (f"Hər iki yoxlamanın işlədiyi müddətdə (routerə "
+                    f"{T['dnsc_try']} sorğu, ondan yan keçərək {T['ctl_try']} sorğu) ")
         if d_r >= 0.3 and d_r >= 3 * max(d_c, 0.05):
-            C.append(scope + f"DNS роутера не ответил на {d_r:.2f}% запросов, "
-                     f"а запрос мимо роутера — на {d_c:.2f}%. Канал исправен, "
-                     "потери возникают в роутере или у DNS-сервера, которому он "
-                     "пересылает запросы.")
+            say(scope + f"DNS роутера не ответил на {d_r:.2f}% запросов, "
+                f"а запрос мимо роутера — на {d_c:.2f}%. Канал исправен, "
+                "потери возникают в роутере или у DNS-сервера, которому он "
+                "пересылает запросы.",
+                scope_az + f"cavabsız qalan sorğuların payı: routerin DNS-i "
+                f"üzrə {d_r:.2f}%, routerdən yan keçən sorğular üzrə "
+                f"{d_c:.2f}%. Kanal sazdır, itkilər routerdə və ya onun "
+                "sorğuları ötürdüyü DNS serverində yaranır.")
         elif d_c >= 0.3:
-            C.append(scope + f"без ответа остались {d_r:.2f}% запросов к DNS "
-                     f"роутера и {d_c:.2f}% запросов мимо него. Теряются и те, "
-                     "и другие: причина в канале, а не в DNS роутера.")
+            say(scope + f"без ответа остались {d_r:.2f}% запросов к DNS "
+                f"роутера и {d_c:.2f}% запросов мимо него. Теряются и те, "
+                "и другие: причина в канале, а не в DNS роутера.",
+                scope_az + f"cavabsız qalan sorğuların payı: routerin DNS-i "
+                f"üzrə {d_r:.2f}%, ondan yan keçən sorğular üzrə {d_c:.2f}%. "
+                "Hər ikisi itir: səbəb routerin DNS-ində deyil, kanaldadır.")
         else:
-            C.append(scope + f"потери малы и одинаковы: {d_r:.2f}% у DNS роутера "
-                     f"и {d_c:.2f}% мимо него. Часы с высокой нагрузкой в это "
-                     "сравнение могли ещё не попасть.")
+            say(scope + f"потери малы и одинаковы: {d_r:.2f}% у DNS роутера "
+                f"и {d_c:.2f}% мимо него. Часы с высокой нагрузкой в это "
+                "сравнение могли ещё не попасть.",
+                scope_az + f"itkilər azdır və eynidir: routerin DNS-i üzrə "
+                f"{d_r:.2f}%, ondan yan keçərək {d_c:.2f}%. Yüksək yüklənmə "
+                "saatları hələ bu müqayisəyə düşməmiş ola bilər.")
     if n_load:
-        C.append(f"Ещё {plural(n_load, 'обрыв сопровождался', 'обрыва сопровождались', 'обрывов сопровождались')} "
-                 "замедлением или перебоями "
-                 "ответа роутера по локальной сети. Это признак перегрузки "
-                 "роутера, но не строгое доказательство.")
+        say(f"Ещё {plural(n_load, 'обрыв сопровождался', 'обрыва сопровождались', 'обрывов сопровождались')} "
+            "замедлением или перебоями "
+            "ответа роутера по локальной сети. Это признак перегрузки "
+            "роутера, но не строгое доказательство.",
+            f"Daha {n_load} kəsilmə routerin lokal şəbəkədə ləng və ya "
+            "fasilələrlə cavab verməsi ilə müşayiət olunub. Bu, routerin "
+            "həddən artıq yüklənməsinin əlamətidir, lakin qəti sübut deyil.")
 
     # зависимость от нагрузки
     MIN_N = 720                      # не меньше часа наблюдений в группе
     lo = hi = None
-    if with_dev:
-        filled = [i for i in range(len(DEVICE_BUCKETS)) if A.bucket[i]["n"] >= MIN_N]
-        if len(filled) >= 2:
-            lo, hi = A.bucket[filled[0]], A.bucket[filled[-1]]
-            lo_name = f"при {bucket_label(filled[0])} устройствах"
-            hi_name = f"при {bucket_label(filled[-1])} устройствах"
-        else:
-            C.append("Данных о числе устройств пока недостаточно для сравнения "
-                     "(нужен хотя бы час наблюдений при малой и при большой "
-                     "нагрузке).")
-
+    filled = ([i for i in range(len(DEVICE_BUCKETS)) if A.bucket[i]["n"] >= MIN_N]
+              if with_dev else [])
+    if len(filled) >= 2:
+        lo, hi = A.bucket[filled[0]], A.bucket[filled[-1]]
+        lo_name = f"при {bucket_label(filled[0])} устройствах"
+        hi_name = f"при {bucket_label(filled[-1])} устройствах"
+        lo_az = f"{bucket_label(filled[0])} cihaz olduqda"
+        hi_az = f"{bucket_label(filled[-1])} cihaz olduqda"
     else:
         work, off = _stat(), _stat()
         for h in range(24):
@@ -986,50 +1100,81 @@ def render(A):
             lo, hi = off, work
             lo_name = "в остальное время"
             hi_name = f"с {WORK_HOURS[0]:02d}:00 до {WORK_HOURS[1]:02d}:00"
+            lo_az = "qalan vaxtda"
+            hi_az = f"{WORK_HOURS[0]:02d}:00–{WORK_HOURS[1]:02d}:00 arasında"
         else:
-            C.append(f"Для сравнения нагрузки нужны данные и за рабочие часы "
-                     f"({WORK_HOURS[0]:02d}:00–{WORK_HOURS[1]:02d}:00), и за "
-                     f"нерабочие — не меньше часа каждого. Пока их недостаточно.")
+            say(f"Для сравнения нагрузки нужны данные и за рабочие часы "
+                f"({WORK_HOURS[0]:02d}:00–{WORK_HOURS[1]:02d}:00), и за "
+                f"нерабочие — не меньше часа каждого. Пока их недостаточно.",
+                f"Yüklənməni müqayisə etmək üçün həm iş saatları "
+                f"({WORK_HOURS[0]:02d}:00–{WORK_HOURS[1]:02d}:00), həm də "
+                f"qeyri-iş saatları üzrə ən azı bir saatlıq məlumat lazımdır. "
+                f"Hələlik kifayət deyil.")
     if lo is not None:
         p_lo, p_hi = pct(lo["bad"], lo["n"]), pct(hi["bad"], hi["n"])
         r_lo, r_hi = quantile(lo["rtt"], 0.5), quantile(hi["rtt"], 0.5)
         facts = (f"доля замеров с отклонениями {hi_name} — {p_hi:.2f}%, "
                  f"{lo_name} — {p_lo:.2f}%; полных обрывов {hi['outages']} "
                  f"против {lo['outages']}")
+        facts_az = (f"kənarlaşma olan ölçmələrin payı {hi_az} — {p_hi:.2f}%, "
+                    f"{lo_az} — {p_lo:.2f}%; tam kəsilmələrin sayı: "
+                    f"{hi['outages']} və {lo['outages']}")
         if p_hi >= 0.3 and p_hi >= 3 * max(p_lo, 0.01):
-            C.append("Сбои зависят от нагрузки: " + facts + ". Провайдер не знает, "
-                     "сколько устройств в локальной сети, поэтому такая "
-                     "зависимость указывает на оборудование внутри сети.")
+            say("Сбои зависят от нагрузки: " + facts + ". Провайдер не знает, "
+                "сколько устройств в локальной сети, поэтому такая "
+                "зависимость указывает на оборудование внутри сети.",
+                "Nasazlıqlar yüklənmədən asılıdır: " + facts_az + ". Provayder "
+                "lokal şəbəkədə neçə cihaz olduğunu bilmir, ona görə də belə "
+                "asılılıq şəbəkə daxilindəki avadanlığa işarə edir.")
         else:
-            C.append("Зависимости сбоев от нагрузки не видно: " + facts + ". "
-                     "Эти данные не подтверждают, что роутер не справляется "
-                     "с нагрузкой.")
+            say("Зависимости сбоев от нагрузки не видно: " + facts + ". "
+                "Эти данные не подтверждают, что роутер не справляется "
+                "с нагрузкой.",
+                "Nasazlıqların yüklənmədən asılılığı görünmür: " + facts_az
+                + ". Bu məlumatlar routerin yüklənmənin öhdəsindən gəlmədiyini "
+                "təsdiqləmir.")
         if r_lo and r_hi and r_hi >= max(2 * r_lo, r_lo + 5):
-            C.append(f"Роутер под нагрузкой отвечает медленнее: обычная задержка "
-                     f"по локальной сети {r_hi:.0f} мс {hi_name} против "
-                     f"{r_lo:.0f} мс {lo_name}.")
+            say(f"Роутер под нагрузкой отвечает медленнее: обычная задержка "
+                f"по локальной сети {r_hi:.0f} мс {hi_name} против "
+                f"{r_lo:.0f} мс {lo_name}.",
+                f"Yüklənmə zamanı router daha ləng cavab verir: lokal şəbəkədə "
+                f"adi gecikmə {hi_az} {r_hi:.0f} ms, {lo_az} {r_lo:.0f} ms.")
         s_lo, s_hi = slow_share(lo, thr), slow_share(hi, thr)
         if s_hi >= 0.5 and s_hi >= 3 * max(s_lo, 0.05):
-            C.append(f"Под нагрузкой интернет замедляется: медленных замеров "
-                     f"{s_hi:.2f}% {hi_name} против {s_lo:.2f}% {lo_name}.")
+            say(f"Под нагрузкой интернет замедляется: медленных замеров "
+                f"{s_hi:.2f}% {hi_name} против {s_lo:.2f}% {lo_name}.",
+                f"Yüklənmə zamanı internet ləngiyir: ləng ölçmələrin payı "
+                f"{hi_az} {s_hi:.2f}%, {lo_az} {s_lo:.2f}%.")
         if with_dns and lo["dns_try"] >= MIN_N and hi["dns_try"] >= MIN_N:
             d_lo = pct(lo["dns_lost"], lo["dns_try"])
             d_hi = pct(hi["dns_lost"], hi["dns_try"])
             if d_hi >= 0.5 and d_hi >= 3 * max(d_lo, 0.05):
-                C.append(f"DNS роутера под нагрузкой теряет запросы чаще: "
-                         f"{d_hi:.2f}% {hi_name} против {d_lo:.2f}% {lo_name}.")
+                say(f"DNS роутера под нагрузкой теряет запросы чаще: "
+                    f"{d_hi:.2f}% {hi_name} против {d_lo:.2f}% {lo_name}.",
+                    f"Yüklənmə zamanı routerin DNS-i sorğuları daha tez-tez "
+                    f"itirir: {hi_az} {d_hi:.2f}%, {lo_az} {d_lo:.2f}%.")
             else:
-                C.append(f"Потери DNS роутера от нагрузки не зависят: "
-                         f"{d_hi:.2f}% {hi_name} и {d_lo:.2f}% {lo_name}.")
+                say(f"Потери DNS роутера от нагрузки не зависят: "
+                    f"{d_hi:.2f}% {hi_name} и {d_lo:.2f}% {lo_name}.",
+                    f"Routerin DNS itkiləri yüklənmədən asılı deyil: "
+                    f"{hi_az} {d_hi:.2f}%, {lo_az} {d_lo:.2f}%.")
     if n_unknown:
-        C.append(f"{plural(n_unknown, 'обрыв', 'обрыва', 'обрывов')} этим замером нельзя отнести ни к роутеру, "
-                 "ни к провайдеру: роутер отвечал нормально, а трафик наружу не "
-                 "шёл. Различить можно двумя способами: запросить у провайдера "
-                 "журнал состояния линии за указанные выше времена либо в момент "
-                 "сбоя посмотреть статус WAN в интерфейсе роутера.")
+        say(f"{plural(n_unknown, 'обрыв', 'обрыва', 'обрывов')} этим замером нельзя отнести ни к роутеру, "
+            "ни к провайдеру: роутер отвечал нормально, а трафик наружу не "
+            "шёл. Различить можно двумя способами: запросить у провайдера "
+            "журнал состояния линии за указанные выше времена либо в момент "
+            "сбоя посмотреть статус WAN в интерфейсе роутера.",
+            f"{n_unknown} kəsilməni bu ölçmə ilə nə routerə, nə də provayderə "
+            "aid etmək mümkün deyil: router normal cavab verirdi, lakin "
+            "trafik xaricə getmirdi. Ayırd etməyin iki yolu var: provayderdən "
+            "yuxarıda göstərilən vaxtlar üzrə xəttin vəziyyət jurnalını "
+            "istəmək və ya nasazlıq anında routerin interfeysində WAN "
+            "statusuna baxmaq.")
     if not C:
-        C.append("Отклонения единичные; оснований для выводов о причине нет.")
+        say("Отклонения единичные; оснований для выводов о причине нет.",
+            "Kənarlaşmalar təkdir; səbəb barədə nəticə çıxarmağa əsas yoxdur.")
     A.conclusions = C
+    A.conclusions_az = CA
     for i, c in enumerate(C, 1):
         L += wrap(f"{i}. {c}", 76, "  ", "     ")
     L.append("")
@@ -1079,7 +1224,7 @@ def _merge(stats):
     m = _stat()
     for s in stats:
         for k in ("n", "bad", "sec", "black_sec", "dns_try", "dns_lost",
-                  "ctl_try", "ctl_lost"):
+                  "ctl_try", "ctl_lost", "dev_sum", "dev_n"):
             m[k] += s[k]
         m["rtt"].extend(s["rtt"])
         m["ext"].extend(s["ext"])
@@ -1120,6 +1265,7 @@ def build_timeline(A):
             "ctl": _r(pct(m["ctl_lost"], m["ctl_try"])) if m["ctl_try"] else None,
             "rm": _r(quantile(m["rtt"], 0.5), 1), "r95": _r(quantile(m["rtt"], 0.95), 1),
             "em": _r(quantile(m["ext"], 0.5), 1), "e95": _r(quantile(m["ext"], 0.95), 1),
+            "dev": _r(m["dev_sum"] / m["dev_n"], 1) if m["dev_n"] else None,
         })
 
     start_sec = b0 * per * TL_STEP_SEC
@@ -1149,11 +1295,28 @@ def build_timeline(A):
 
 
 EVENT_KINDS = {
-    "outage": "Полный обрыв интернета",
-    "dns": "Отказ DNS роутера",
-    "partial": "Частичная потеря связи",
-    "gwmute": "Роутер молчал по локальной сети",
+    "outage": {"ru": "Полный обрыв интернета", "az": "İnternetin tam kəsilməsi"},
+    "dns": {"ru": "Отказ DNS роутера", "az": "Routerin DNS-i cavab vermədi"},
+    "partial": {"ru": "Частичная потеря связи", "az": "Əlaqənin qismən itməsi"},
+    "gwmute": {"ru": "Роутер молчал по локальной сети",
+               "az": "Router lokal şəbəkədə cavab vermirdi"},
 }
+EVENT_NOTES = {
+    "dns": {"ru": "Интернет по IP в это время работал",
+            "az": "Bu vaxt IP üzrə internet işləyirdi"},
+    "partial": {"ru": "Недоступна часть внешних ресурсов",
+                "az": "Xarici resursların bir hissəsi əlçatmaz idi"},
+    "gwmute": {"ru": "Интернет в это время работал",
+               "az": "Bu vaxt internet işləyirdi"},
+}
+
+
+def _cap(t):
+    return t[:1].upper() + t[1:] if t else ""
+
+
+def _num(x):
+    return f"{x:.2f}%".replace(".", ",")
 
 
 def render_html(A, text_report):
@@ -1170,84 +1333,139 @@ def render_html(A, text_report):
             continue
         if e["kind"] != "outage" and e["dur"] < OUTAGE_MIN_SEC:
             continue
-        note = e.get("text", "") or {
-            "dns": "Интернет по IP в это время работал",
-            "partial": "Недоступна часть внешних ресурсов",
-            "gwmute": "Интернет в это время работал",
-        }.get(e["kind"], "")
+        if e.get("text"):
+            note = {"ru": e["text"], "az": e.get("text_az", e["text"])}
+        else:
+            note = EVENT_NOTES.get(e["kind"], {"ru": "", "az": ""})
         if e["kind"] == "dns" and e["ctl_try"]:
-            note = ("Контрольный DNS в это время отвечал — отказ на стороне роутера"
-                    if e["ctl_lost"] == 0 else
-                    f"Контрольный DNS тоже терял запросы ({e['ctl_lost']} из {e['ctl_try']})")
+            if e["ctl_lost"] == 0:
+                note = {"ru": "Контрольный DNS в это время отвечал — отказ на "
+                              "стороне роутера",
+                        "az": "Nəzarət DNS-i bu vaxt cavab verirdi — nasazlıq "
+                              "router tərəfindədir"}
+            else:
+                note = {"ru": f"Контрольный DNS тоже терял запросы "
+                              f"({e['ctl_lost']} из {e['ctl_try']})",
+                        "az": f"Nəzarət DNS-i də sorğuları itirirdi "
+                              f"({e['ctl_try']} sorğudan {e['ctl_lost']})"}
+        black = e["sec"]["blackout"]
         events.append({
             "a": round(pos(e["start"]), 3), "b": round(pos(e["end"]), 3),
             "start": fmt_dt(e["start"]),
-            "dur": fmt_dur(e["dur"]) + (
-                f" (без интернета {fmt_dur(e['sec']['blackout'])})"
-                if e["kind"] == "outage" else ""),
+            "dur": {
+                "ru": fmt_dur(e["dur"]) + (
+                    f" (без интернета {fmt_dur(black)})"
+                    if e["kind"] == "outage" else ""),
+                "az": fmt_dur(e["dur"], "az") + (
+                    f" (internetsiz {fmt_dur(black, 'az')})"
+                    if e["kind"] == "outage" else "")},
             "kind": EVENT_KINDS[e["kind"]],
-            "note": (note[:1].upper() + note[1:]) if note else "",
+            "note": {k: _cap(v) for k, v in note.items()},
         })
-    gaps = [{"a": round(pos(st), 3), "b": round(pos(en), 3),
-             "start": fmt_dt(st), "dur": fmt_dur(dt)} for st, en, dt in A.gaps]
+    gaps = [{"a": round(pos(st), 3), "b": round(pos(en), 3)}
+            for st, en, dt in A.gaps]
 
     outages = [e for e in A.events if e["kind"] == "outage"]
     blips = sum(1 for e in A.events if e["kind"] == "blip")
+    black_all = sum(e["sec"]["blackout"] for e in outages)
     tiles = [
-        {"k": "Полных обрывов интернета", "v": str(len(outages)),
-         "s": ("суммарно " + fmt_dur(sum(e["sec"]["blackout"] for e in outages))
-               if outages else f"коротких (до {OUTAGE_MIN_SEC} сек): {blips}")},
-        {"k": "Интернет был доступен",
-         "v": f"{100 - pct(T['black_sec'], T['sec']):.2f}%".replace(".", ","),
-         "s": "времени наблюдения"},
-        {"k": "Замеров с отклонениями",
-         "v": f"{pct(T['bad'], T['n']):.2f}%".replace(".", ","),
-         "s": f"из {T['n']}"},
+        {"k": {"ru": "Полных обрывов интернета", "az": "İnternetin tam kəsilməsi"},
+         "v": str(len(outages)),
+         "s": ({"ru": "суммарно " + fmt_dur(black_all),
+                "az": "cəmi " + fmt_dur(black_all, "az")} if outages else
+               {"ru": f"коротких (до {OUTAGE_MIN_SEC} сек): {blips}",
+                "az": f"qısa ({OUTAGE_MIN_SEC} san-dək): {blips}"})},
+        {"k": {"ru": "Интернет был доступен", "az": "İnternet əlçatan olub"},
+         "v": _num(100 - pct(T["black_sec"], T["sec"])),
+         "s": {"ru": "времени наблюдения", "az": "müşahidə vaxtının"}},
+        {"k": {"ru": "Замеров с отклонениями", "az": "Kənarlaşma olan ölçmələr"},
+         "v": _num(pct(T["bad"], T["n"])),
+         "s": {"ru": f"из {T['n']}", "az": f"{T['n']} ölçmədən"}},
     ]
     if A.has_rdns:
         tiles.append({
-            "k": "DNS роутера: без ответа",
-            "v": f"{pct(T['dns_lost'], T['dns_try']):.2f}%".replace(".", ","),
-            "s": f"{T['dns_lost']} из {T['dns_try']} запросов"})
+            "k": {"ru": "DNS роутера: без ответа", "az": "Routerin DNS-i: cavabsız"},
+            "v": _num(pct(T["dns_lost"], T["dns_try"])),
+            "s": {"ru": f"{T['dns_lost']} из {T['dns_try']} запросов",
+                  "az": f"{T['dns_try']} sorğudan {T['dns_lost']}"}})
     if thr is not None:
         n_slow = sum(1 for x in T["ext"] if x >= thr)
-        tiles.append({"k": "Медленных замеров",
-                      "v": f"{pct(n_slow, len(T['ext'])):.2f}%".replace(".", ","),
-                      "s": f"задержка наружу от {thr:.0f} мс"})
+        tiles.append({
+            "k": {"ru": "Медленных замеров", "az": "Ləng ölçmələr"},
+            "v": _num(pct(n_slow, len(T["ext"]))),
+            "s": {"ru": f"задержка наружу от {thr:.0f} мс",
+                  "az": f"xaricə gecikmə {thr:.0f} ms və daha çox"}})
 
+    MS = {"ru": "мс", "az": "ms"}
+    usual = {"ru": "Обычная задержка", "az": "Adi gecikmə"}
+    worst = {"ru": "5% худших замеров", "az": "Ən pis 5% ölçmə"}
     charts = []
+    if T["dev_n"]:
+        dev_name = {"ru": "Устройств в сети", "az": "Şəbəkədəki cihazlar"}
+        charts.append({
+            "title": dev_name, "unit": "", "type": "line", "floor": 20,
+            "series": [{"key": "dev", "name": dev_name, "c": 1}],
+            "note": {"ru": "Сколько устройств ответило на ARP-запрос сервера, "
+                           "включая серверы и роутеры. Ночной уровень — "
+                           "постоянное оборудование; всё, что выше, — "
+                           "устройства людей.",
+                     "az": "Serverin ARP sorğusuna cavab verən cihazların sayı "
+                           "(serverlər və routerlər daxil). Gecə səviyyəsi "
+                           "daimi avadanlıqdır; ondan yuxarı olan hər şey "
+                           "insanların cihazlarıdır."}})
     if A.has_rdns:
-        series = [{"key": "dns", "name": f"DNS роутера ({GATEWAY})", "c": 1}]
+        series = [{"key": "dns", "c": 1,
+                   "name": {"ru": f"DNS роутера ({GATEWAY})",
+                            "az": f"Routerin DNS-i ({GATEWAY})"}}]
         if T["ctl_try"]:
-            series.append({"key": "ctl", "name": "Контроль: 8.8.8.8 мимо роутера", "c": 2})
-        charts.append({"title": "DNS-запросы без ответа", "unit": "%", "type": "line",
-                       "floor": 1, "series": series,
-                       "note": "Доля запросов, на которые не пришёл ответ. Рост "
-                               "у роутера при ровном контроле указывает на роутер."})
-    charts.append({"title": "Замеры с отклонениями", "unit": "%", "type": "bar",
-                   "floor": 1,
-                   "series": [{"key": "bad", "name": "Замеры с отклонениями", "c": 1}],
-                   "note": "Доля замеров, в которых что-то не ответило: внешние "
-                           "ресурсы, DNS роутера или сам роутер."})
-    charts.append({"title": "Ответ роутера по локальной сети", "unit": "мс",
-                   "type": "line", "floor": 10,
-                   "series": [{"key": "rm", "name": "Обычная задержка", "c": 1},
-                              {"key": "r95", "name": "5% худших замеров", "c": 2}],
-                   "note": "Время TCP-подключения к роутеру. Рост в часы занятий "
-                           "— признак нагрузки на роутер."})
-    charts.append({"title": "Задержка до внешних ресурсов", "unit": "мс",
-                   "type": "line", "floor": 50,
-                   "series": [{"key": "em", "name": "Обычная задержка", "c": 1},
-                              {"key": "e95", "name": "5% худших замеров", "c": 2}],
-                   "note": "Время TCP-подключения к внешним серверам через роутер."})
+            series.append({"key": "ctl", "c": 2,
+                           "name": {"ru": "Контроль: 8.8.8.8 мимо роутера",
+                                    "az": "Nəzarət: routerdən yan keçərək 8.8.8.8"}})
+        charts.append({
+            "title": {"ru": "DNS-запросы без ответа", "az": "Cavabsız DNS sorğuları"},
+            "unit": "%", "type": "line", "floor": 1, "series": series,
+            "note": {"ru": "Доля запросов, на которые не пришёл ответ. Рост "
+                           "у роутера при ровном контроле указывает на роутер.",
+                     "az": "Cavab gəlməyən sorğuların payı. Nəzarət xətti sabit "
+                           "qalarkən routerdə artım routerə işarə edir."}})
+    bad_name = {"ru": "Замеры с отклонениями", "az": "Kənarlaşma olan ölçmələr"}
+    charts.append({
+        "title": bad_name, "unit": "%", "type": "bar", "floor": 1,
+        "series": [{"key": "bad", "name": bad_name, "c": 1}],
+        "note": {"ru": "Доля замеров, в которых что-то не ответило: внешние "
+                       "ресурсы, DNS роутера или сам роутер.",
+                 "az": "Nəyinsə cavab vermədiyi ölçmələrin payı: xarici "
+                       "resurslar, routerin DNS-i və ya routerin özü."}})
+    charts.append({
+        "title": {"ru": "Ответ роутера по локальной сети",
+                  "az": "Routerin lokal şəbəkədə cavabı"},
+        "unit": MS, "type": "line", "floor": 10,
+        "series": [{"key": "rm", "name": usual, "c": 1},
+                   {"key": "r95", "name": worst, "c": 2}],
+        "note": {"ru": "Время TCP-подключения к роутеру. Рост в часы занятий "
+                       "— признак нагрузки на роутер.",
+                 "az": "Routerə TCP qoşulma vaxtı. Dərs saatlarında artım "
+                       "routerin yüklənməsinin əlamətidir."}})
+    charts.append({
+        "title": {"ru": "Задержка до внешних ресурсов",
+                  "az": "Xarici resurslara qədər gecikmə"},
+        "unit": MS, "type": "line", "floor": 50,
+        "series": [{"key": "em", "name": usual, "c": 1},
+                   {"key": "e95", "name": worst, "c": 2}],
+        "note": {"ru": "Время TCP-подключения к внешним серверам через роутер.",
+                 "az": "Router vasitəsilə xarici serverlərə TCP qoşulma vaxtı."}})
 
+    concl_ru = getattr(A, "conclusions", [])
+    concl_az = getattr(A, "conclusions_az", concl_ru)
     data = {
-        "period": f"с {fmt_dt(A.first)} по {fmt_dt(A.last)}",
-        "observed": fmt_dur(T["sec"]), "samples": T["n"],
-        "step": (f"{step_min} мин" if step_min < 60 else f"{step_min // 60} ч"),
+        "from": fmt_dt(A.first), "to": fmt_dt(A.last),
+        "observed": both(lambda lg: fmt_dur(T["sec"], lg)), "samples": T["n"],
+        "step": ({"ru": f"{step_min} мин", "az": f"{step_min} dəq"}
+                 if step_min < 60 else
+                 {"ru": f"{step_min // 60} ч", "az": f"{step_min // 60} saat"}),
         "points": points, "ticks": ticks, "events": events, "gaps": gaps,
         "tiles": tiles, "charts": charts,
-        "conclusions": getattr(A, "conclusions", []),
+        "conclusions": [{"ru": r, "az": z} for r, z in zip(concl_ru, concl_az)],
     }
     blob = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
     return (HTML_TEMPLATE
@@ -1280,7 +1498,17 @@ HTML_TEMPLATE = r"""<!doctype html>
 body { margin: 0; background: var(--page); color: var(--text);
   font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
 main { max-width: 1100px; margin: 0 auto; padding: 24px 16px 48px; }
-h1 { font-size: 22px; margin: 0 0 4px; }
+h1 { font-size: 22px; margin: 0; }
+.top { display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; margin-bottom: 4px; }
+.langs { display: flex; gap: 6px; flex: none; }
+.langs button { padding: 2px; border: 2px solid transparent; border-radius: 6px;
+  background: none; cursor: pointer; line-height: 0; opacity: .55; }
+.langs button svg { display: block; width: 30px; height: 20px; border-radius: 3px;
+  box-shadow: 0 0 0 1px var(--border); }
+.langs button:hover { opacity: .85; }
+.langs button[aria-pressed="true"] { border-color: var(--text); opacity: 1; }
+.langs button:focus-visible { outline: 2px solid var(--s1); outline-offset: 2px; }
 h2 { font-size: 15px; margin: 0; }
 .sub { color: var(--text2); margin: 0 0 20px; }
 .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
@@ -1333,26 +1561,32 @@ ol li { margin-bottom: 6px; }
 </head>
 <body>
 <main>
-  <h1>NetDiag — отчёт</h1>
+  <header class="top">
+    <h1 id="title"></h1>
+    <div class="langs" role="group" aria-label="Язык / Dil">
+      <button type="button" data-lang="ru" title="Русский" aria-label="Русский"><svg viewBox="0 0 30 20" width="30" height="20" aria-hidden="true"><rect width="30" height="20" fill="#fff"/><rect y="6.67" width="30" height="6.67" fill="#0039a6"/><rect y="13.33" width="30" height="6.67" fill="#d52b1e"/></svg></button>
+      <button type="button" data-lang="az" title="Azərbaycan dili" aria-label="Azərbaycan dili"><svg viewBox="0 0 30 20" width="30" height="20" aria-hidden="true"><rect width="30" height="20" fill="#ef3340"/><rect width="30" height="6.67" fill="#00b5e2"/><rect y="13.33" width="30" height="6.67" fill="#509e2f"/><circle cx="13.6" cy="10" r="3" fill="#fff"/><circle cx="14.5" cy="10" r="2.45" fill="#ef3340"/><polygon points="17.10,8.25 17.43,9.21 18.34,8.76 17.89,9.67 18.85,10.00 17.89,10.33 18.34,11.24 17.43,10.79 17.10,11.75 16.77,10.79 15.86,11.24 16.31,10.33 15.35,10.00 16.31,9.67 15.86,8.76 16.77,9.21" fill="#fff"/></svg></button>
+    </div>
+  </header>
   <p class="sub" id="sub"></p>
   <div class="tiles" id="tiles"></div>
   <div class="card" id="concl-card">
-    <h2>Что из этого следует</h2>
+    <h2 id="concl-title"></h2>
     <ol id="concl"></ol>
   </div>
   <div class="key">
-    <span><i class="sw ev"></i>красная полоса — событие из списка ниже</span>
-    <span><i class="sw gp"></i>серая полоса — сервер не работал, замеров нет</span>
+    <span><i class="sw ev"></i><span id="key-ev"></span></span>
+    <span><i class="sw gp"></i><span id="key-gap"></span></span>
     <span id="stepnote"></span>
   </div>
   <div id="charts"></div>
   <div class="card">
-    <h2>События</h2>
-    <div class="note">Сбои длительностью от 30 секунд. На графиках отмечены красными полосами.</div>
+    <h2 id="ev-title"></h2>
+    <div class="note" id="ev-note"></div>
     <div class="scroll" id="events"></div>
   </div>
   <details>
-    <summary>Полный текстовый отчёт с таблицами по часам</summary>
+    <summary id="full-title"></summary>
     <pre>__TEXT__</pre>
   </details>
 </main>
@@ -1386,54 +1620,103 @@ ol li { margin-bottom: 6px; }
     return n * p;
   }
 
-  document.getElementById('sub').textContent =
-    'Период: ' + D.period + ' · наблюдение ' + D.observed + ' · замеров: ' + D.samples;
-  document.getElementById('stepnote').textContent = 'одна точка графика = ' + D.step;
-  var tiles = document.getElementById('tiles');
-  var cl = document.getElementById('concl');
-  (D.conclusions || []).forEach(function (t) { h('li', null, t, cl); });
-  if (!(D.conclusions || []).length) document.getElementById('concl-card').style.display = 'none';
-  D.tiles.forEach(function (t) {
-    var d = h('div', 'tile', null, tiles);
-    h('div', 'k', t.k, d); h('div', 'v', t.v, d); h('div', 's', t.s, d);
-  });
+  var UI = {
+    ru: { title: 'NetDiag — отчёт', period: 'Период', obs: 'наблюдение', samples: 'замеров',
+          keyEv: 'красная полоса — событие из списка ниже',
+          keyGap: 'серая полоса — сервер не работал, замеров нет',
+          step: 'одна точка графика = ', concl: 'Что из этого следует', events: 'События',
+          evNote: 'Сбои длительностью от 30 секунд. На графиках отмечены красными полосами.',
+          noEvents: 'Событий за период нет.',
+          th: ['Начало', 'Длительность', 'Что произошло', 'Что наблюдалось'],
+          full: 'Полный текстовый отчёт с таблицами по часам',
+          noData: 'замеров нет', n: 'замеров: ' },
+    az: { title: 'NetDiag — hesabat', period: 'Dövr', obs: 'müşahidə', samples: 'ölçmə sayı',
+          keyEv: 'qırmızı zolaq — aşağıdakı siyahıdan hadisə',
+          keyGap: 'boz zolaq — server işləmirdi, ölçmə yoxdur',
+          step: 'qrafikin bir nöqtəsi = ', concl: 'Bundan nə nəticə çıxır', events: 'Hadisələr',
+          evNote: '30 saniyədən uzun nasazlıqlar. Qrafiklərdə qırmızı zolaqlarla göstərilib.',
+          noEvents: 'Bu dövrdə hadisə olmayıb.',
+          th: ['Başlanğıc', 'Müddət', 'Nə baş verib', 'Nə müşahidə olunub'],
+          full: 'Saatlar üzrə cədvəllərlə tam mətn hesabatı (rus dilində)',
+          noData: 'ölçmə yoxdur', n: 'ölçmə sayı: ' }
+  };
+  var lang = 'ru';
+  try { lang = localStorage.getItem('netdiag-lang') || 'ru'; } catch (e) {}
+  if (!UI[lang]) lang = 'ru';
+  function T(x) { return (x && typeof x === 'object') ? (x[lang] != null ? x[lang] : x.ru) : x; }
+  function $(id) { return document.getElementById(id); }
+  var cards = [];
 
-  var ev = document.getElementById('events');
-  if (!D.events.length) {
-    h('div', 'empty', 'Событий за период нет.', ev);
-  } else {
-    var tb = h('table', null, null, ev), tr = h('tr', null, null, tb);
-    ['Начало', 'Длительность', 'Что произошло', 'Что наблюдалось'].forEach(function (x) { h('th', null, x, tr); });
-    D.events.forEach(function (e) {
-      var r = h('tr', null, null, tb);
-      h('td', 'num', e.start, r); h('td', 'num', e.dur, r);
-      h('td', null, e.kind, r); h('td', null, e.note, r);
+  function renderAll() {
+    var U = UI[lang];
+    document.documentElement.lang = lang;
+    document.title = U.title;
+    $('title').textContent = U.title;
+    $('sub').textContent = U.period + ': ' + D.from + ' – ' + D.to + ' · ' + U.obs + ' ' +
+      T(D.observed) + ' · ' + U.samples + ': ' + D.samples;
+    $('key-ev').textContent = U.keyEv; $('key-gap').textContent = U.keyGap;
+    $('stepnote').textContent = U.step + T(D.step);
+    $('concl-title').textContent = U.concl; $('ev-title').textContent = U.events;
+    $('ev-note').textContent = U.evNote; $('full-title').textContent = U.full;
+    [].forEach.call(document.querySelectorAll('.langs button'), function (b) {
+      b.setAttribute('aria-pressed', b.getAttribute('data-lang') === lang ? 'true' : 'false');
     });
-  }
 
-  var host = document.getElementById('charts');
-  var cards = D.charts.map(function (c) {
-    var card = h('div', 'card', null, host);
-    h('h2', null, c.title + ', ' + c.unit, card);
-    h('div', 'note', c.note, card);
-    if (c.series.length > 1) {
-      var lg = h('div', 'legend', null, card);
-      c.series.forEach(function (s) {
-        var sp = h('span', null, null, lg), i = h('i', null, null, sp);
-        i.style.background = 'var(--s' + s.c + ')';
-        sp.appendChild(document.createTextNode(s.name));
+    var tiles = $('tiles'); tiles.textContent = '';
+    D.tiles.forEach(function (t) {
+      var d = h('div', 'tile', null, tiles);
+      h('div', 'k', T(t.k), d); h('div', 'v', t.v, d); h('div', 's', T(t.s), d);
+    });
+
+    var cl = $('concl'); cl.textContent = '';
+    (D.conclusions || []).forEach(function (t) { h('li', null, T(t), cl); });
+    $('concl-card').style.display = (D.conclusions || []).length ? '' : 'none';
+
+    var ev = $('events'); ev.textContent = '';
+    if (!D.events.length) {
+      h('div', 'empty', U.noEvents, ev);
+    } else {
+      var tb = h('table', null, null, ev), tr = h('tr', null, null, tb);
+      U.th.forEach(function (x) { h('th', null, x, tr); });
+      D.events.forEach(function (e) {
+        var r = h('tr', null, null, tb);
+        h('td', 'num', e.start, r); h('td', 'num', T(e.dur), r);
+        h('td', null, T(e.kind), r); h('td', null, T(e.note), r);
       });
     }
-    var box = h('div', null, null, card);
-    var tip = h('div', 'tip', null, card);
-    return { c: c, card: card, box: box, tip: tip };
+
+    var host = $('charts'); host.textContent = '';
+    cards = D.charts.map(function (c) {
+      var card = h('div', 'card', null, host);
+      h('h2', null, T(c.title) + (T(c.unit) ? ', ' + T(c.unit) : ''), card);
+      h('div', 'note', T(c.note), card);
+      if (c.series.length > 1) {
+        var lg = h('div', 'legend', null, card);
+        c.series.forEach(function (s) {
+          var sp = h('span', null, null, lg), i = h('i', null, null, sp);
+          i.style.background = 'var(--s' + s.c + ')';
+          sp.appendChild(document.createTextNode(T(s.name)));
+        });
+      }
+      var box = h('div', null, null, card);
+      var tip = h('div', 'tip', null, card);
+      return { c: c, card: card, box: box, tip: tip };
+    });
+    cards.forEach(draw);
+  }
+  [].forEach.call(document.querySelectorAll('.langs button'), function (b) {
+    b.addEventListener('click', function () {
+      lang = b.getAttribute('data-lang');
+      try { localStorage.setItem('netdiag-lang', lang); } catch (e) {}
+      renderAll();
+    });
   });
 
   function draw(o) {
     var c = o.c, W = Math.max(320, o.box.clientWidth), H = 190;
     var m = { l: 46, r: 10, t: 8, b: 22 }, pw = W - m.l - m.r, ph = H - m.t - m.b;
     o.box.textContent = '';
-    var svg = el('svg', { viewBox: '0 0 ' + W + ' ' + H, role: 'img', 'aria-label': c.title }, o.box);
+    var svg = el('svg', { viewBox: '0 0 ' + W + ' ' + H, role: 'img', 'aria-label': T(c.title) }, o.box);
     var max = c.floor;
     D.points.forEach(function (p) { c.series.forEach(function (s) { if (p[s.key] != null && p[s.key] > max) max = p[s.key]; }); });
     var step = nice(max / 4); max = step * 4;
@@ -1491,15 +1774,15 @@ ol li { margin-bottom: 6px; }
       hair.setAttribute('x1', x); hair.setAttribute('x2', x); hair.setAttribute('visibility', 'visible');
       var tip = o.tip; tip.textContent = '';
       h('div', 't', p.label, tip);
-      if (!p.n) { h('div', null, 'замеров нет', tip); }
+      if (!p.n) { h('div', null, UI[lang].noData, tip); }
       else {
         c.series.forEach(function (s) {
           var row = h('div', 'r', null, tip), sw = h('i', null, null, row);
           sw.style.background = 'var(--s' + s.c + ')';
-          h('b', null, fmt(p[s.key], c.unit), row);
-          row.appendChild(document.createTextNode(s.name));
+          h('b', null, fmt(p[s.key], T(c.unit)), row);
+          row.appendChild(document.createTextNode(T(s.name)));
         });
-        h('div', 'n', 'замеров: ' + p.n, tip);
+        h('div', 'n', UI[lang].n + p.n, tip);
       }
       tip.style.display = 'block';
       var cr = o.card.getBoundingClientRect(), px = r.left - cr.left + x / sx;
@@ -1513,7 +1796,7 @@ ol li { margin-bottom: 6px; }
     hit.addEventListener('pointerleave', leave);
   }
   function drawAll() { cards.forEach(draw); }
-  drawAll();
+  renderAll();
   var tm; window.addEventListener('resize', function () { clearTimeout(tm); tm = setTimeout(drawAll, 120); });
 })();
 </script>
@@ -1535,7 +1818,7 @@ def build_report(since=None, until=None):
                     continue
                 if (since and ts < since) or (until and ts >= until):
                     continue
-                A.feed(ts, data, r.get("dev") if USE_DEVICE_COUNT else None)
+                A.feed(ts, data, r.get("ndev") if USE_DEVICE_COUNT else None)
     A.finish()
     txt = render(A) if A.first is not None else "Отчёт пуст: нет данных.\n"
     with open(OUT_REPORT, "w", encoding="utf-8") as f:
