@@ -11,6 +11,7 @@ services:
       - ./netdiag.py:/app/netdiag.py:ro
       - ./data:/data
       - /etc/localtime:/etc/localtime:ro
+      - /var/log:/host_log:ro        # журналы сервера для строки о безопасности
     command: python /app/netdiag.py
     deploy:
       resources:

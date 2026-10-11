@@ -46,7 +46,7 @@ case "$CMD" in
     ;;
 
   raw)
-    tail -n 10 data/netdiag.jsonl
+    tail -n 10 "$(ls -t data/netdiag*.jsonl | head -1)"
     ;;
 
   report)
@@ -76,6 +76,7 @@ case "$CMD" in
     echo "  raw      — последние 10 сырых замеров"
     echo "  report   — построить отчёт (не останавливая мониторинг)"
     echo "             report --since 2026-10-12 --until 2026-10-19 — за период"
+    echo "             report --days 30 — за последние 30 суток; --all — за всё время"
     echo "  down     — удалить контейнер (данные остаются)"
     echo "  clean    — удалить контейнер и папку data/"
     exit 1

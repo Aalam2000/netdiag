@@ -16,11 +16,14 @@ NetDiag — мониторинг роутера и интернета с про�
 это объективная мера нагрузки, с которой сопоставляются сбои.
 """
 import fcntl
+import glob
+import gzip
 import ipaddress
 import json
 import logging
 import os
 import random
+import re
 import signal
 import socket
 import statistics
@@ -28,17 +31,26 @@ import struct
 import sys
 import threading
 import time
+import urllib.request
 from array import array
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutTimeout
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 TZ = ZoneInfo("Asia/Baku")
 
 # ==== КОНФИГ ====
 GATEWAY = "192.168.0.1"          # главный роутер
+
+# Что известно о сети академии (установлено 11.10.26, влияет на формулировки
+# отчёта):
+#  - устройствам по DHCP выдаётся DNS 8.8.8.8, DNS роутера они не используют;
+#  - дополнительный роутер раздаёт свою подсеть (двойной NAT), устройства за
+#    ним серверу не видны.
+CLIENTS_USE_ROUTER_DNS = False
+HIDDEN_SUBNETS = ["192.168.1.0/24"]
 LAN_NET = "192.168.0.0/24"       # локальная сеть (для подсчёта устройств)
 
 # (имя, тип, хост, порт). Имена gw_* — роутер, остальные — внешние ресурсы.
@@ -69,6 +81,39 @@ DNS_PROBE_NAME = "google.com"    # какое имя спрашиваем у DNS
 
 INTERVAL_SEC   = 5       # период опроса
 TCP_TIMEOUT    = 2.0     # таймаут одной проверки
+
+# Опрос роутера по UPnP: статус и время соединения с провайдером, счётчики
+# трафика. Работает, только если UPnP на роутере включён.
+UPNP_POLL          = False   # на роутере академии UPnP выключен, доступа к нему нет
+UPNP_POLL_SEC      = 60
+UPNP_RETRY_SEC     = 600     # как часто искать UPnP заново, если его нет
+
+# Серия быстрых проб: BURST_COUNT подключений подряд раз в BURST_SEC.
+# Ловит замирания короче INTERVAL_SEC. Нагрузка — 20 пустых подключений
+# в минуту.
+BURST_PROBE        = True
+BURST_SEC          = 60
+BURST_COUNT        = 20
+BURST_GAP          = 0.1     # пауза между пробами, сек
+BURST_TIMEOUT      = 1.0
+BURST_TARGET       = ("8.8.8.8", 53)
+
+# Состояние самого сервера: процессор, память, диск. Раз в SYS_SEC.
+SYS_STATS          = True
+SYS_SEC            = 60
+DISK_WARN_PCT      = 70      # с какой заполненности диска предупреждать
+DISK_CRIT_PCT      = 85      # с какой — требовать действий
+
+# Состав устройств: постоянным считается устройство, отвечавшее не реже
+# чем в INFRA_SHARE подсчётов; массовое отключение — когда за один подсчёт
+# пропало не меньше DROP_MIN устройств и не меньше DROP_SHARE от всех.
+INFRA_SHARE        = 0.9
+INFRA_MIN_SCANS    = 30
+DROP_MIN           = 6
+DROP_SHARE         = 0.25
+DROP_BACK_SCANS    = 5       # сколько подсчётов ждём возвращения устройств
+DROP_BACK_SHARE    = 0.5     # какая доля должна вернуться, чтобы это был сброс,
+                             # а не люди, ушедшие после занятия
 DNS_TRIES      = 2       # попыток DNS-запроса за замер (как у обычного клиента)
 SLOW_FACTOR    = 3       # «медленный» замер: задержка наружу в 3+ раза выше
 SLOW_MIN_MS    = 100     # обычной и не меньше чем на 100 мс
@@ -90,7 +135,15 @@ WORK_HOURS = (9, 21)     # используется, только если не�
 MAX_EVENTS_LISTED = 150
 
 WORK_DIR   = os.environ.get("NETDIAG_DATA", "/data")
-OUT_JSONL  = f"{WORK_DIR}/netdiag.jsonl"
+OUT_JSONL  = f"{WORK_DIR}/netdiag.jsonl"     # лог старого формата (один файл)
+
+# Лог пишется по файлу на сутки: netdiag-ГГГГ-ММ-ДД.jsonl.
+RETAIN_DAYS = 90        # сколько суток хранить
+REPORT_DAYS = 14        # за сколько последних суток строить отчёт по умолчанию
+
+# Журналы самого сервера (в docker-compose.yml: /var/log:/host_log:ro).
+HOST_LOG_DIR   = os.environ.get("NETDIAG_HOST_LOG", "/host_log")
+SEC_STALE_DAYS = 3      # журнал без записей дольше этого считается неведущимся
 OUT_REPORT = f"{WORK_DIR}/report.txt"
 OUT_HTML   = f"{WORK_DIR}/report.html"
 HEARTBEAT  = f"{WORK_DIR}/heartbeat"
@@ -246,6 +299,262 @@ def sample_all():
     return res
 
 
+# ---- результаты фоновых проверок ----
+# Фоновые потоки кладут сюда свежий результат; основной цикл один раз
+# дописывает его в очередной замер.
+
+_extra = {}
+_extra_lock = threading.Lock()
+
+
+def put_extra(key, value):
+    with _extra_lock:
+        _extra[key] = value
+
+
+def take_extras():
+    with _extra_lock:
+        d = dict(_extra)
+        _extra.clear()
+    return d
+
+
+def _pause(t0, period):
+    while not _stop and time.time() - t0 < period:
+        time.sleep(1)
+
+
+# ---- UPnP: что роутер сам сообщает о соединении с провайдером ----
+
+_NO_PROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def upnp_discover(host, timeout=3.0):
+    """Ищет описание UPnP-устройства на роутере. Возвращает URL или None."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(0.5)
+    try:
+        for st in ("urn:schemas-upnp-org:device:InternetGatewayDevice:1",
+                   "upnp:rootdevice"):
+            msg = ("M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n"
+                   'MAN: "ssdp:discover"\r\nMX: 2\r\nST: ' + st + "\r\n\r\n").encode()
+            for dst in ((host, 1900), ("239.255.255.250", 1900)):
+                try:
+                    s.sendto(msg, dst)
+                except OSError:
+                    pass
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            try:
+                data, addr = s.recvfrom(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if addr[0] != host:
+                continue
+            for line in data.decode("latin-1", "replace").split("\r\n"):
+                if line.lower().startswith("location:"):
+                    return line.split(":", 1)[1].strip()
+    finally:
+        s.close()
+    return None
+
+
+def upnp_services(location, timeout=4.0):
+    """Адреса управления нужных служб: {'wan': (тип, url), 'common': (тип, url)}."""
+    import xml.etree.ElementTree as ET
+    from urllib.parse import urljoin
+    with _NO_PROXY.open(location, timeout=timeout) as r:
+        root = ET.fromstring(r.read())
+    strip = lambda tag: tag.rsplit("}", 1)[-1]
+    base = location
+    for el in root.iter():
+        if strip(el.tag) == "URLBase" and (el.text or "").strip():
+            base = el.text.strip()
+    out = {}
+    for el in root.iter():
+        if strip(el.tag) != "service":
+            continue
+        f = {strip(c.tag): (c.text or "").strip() for c in el}
+        stype, ctl = f.get("serviceType", ""), f.get("controlURL", "")
+        if not ctl:
+            continue
+        if "WANIPConnection" in stype or "WANPPPConnection" in stype:
+            out.setdefault("wan", (stype, urljoin(base, ctl)))
+        elif "WANCommonInterfaceConfig" in stype:
+            out.setdefault("common", (stype, urljoin(base, ctl)))
+    return out
+
+
+def upnp_call(svc, action, timeout=4.0):
+    import xml.etree.ElementTree as ET
+    stype, url = svc
+    body = ('<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/'
+            'soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/'
+            f'encoding/"><s:Body><u:{action} xmlns:u="{stype}"/></s:Body>'
+            '</s:Envelope>').encode()
+    req = urllib.request.Request(url, data=body, headers={
+        "Content-Type": 'text/xml; charset="utf-8"',
+        "SOAPAction": f'"{stype}#{action}"'})
+    with _NO_PROXY.open(req, timeout=timeout) as r:
+        root = ET.fromstring(r.read())
+    return {el.tag.rsplit("}", 1)[-1]: (el.text or "").strip()
+            for el in root.iter() if not len(el)}
+
+
+def upnp_poll(svcs):
+    """Один опрос: статус и время соединения, внешний адрес, счётчики байт."""
+    def num(d, key):
+        try:
+            return int(d.get(key, ""))
+        except ValueError:
+            return None
+    out = {}
+    if "wan" in svcs:
+        d = upnp_call(svcs["wan"], "GetStatusInfo")
+        out["st"] = d.get("NewConnectionStatus")
+        out["up"] = num(d, "NewUptime")
+        try:
+            out["ip"] = upnp_call(svcs["wan"], "GetExternalIPAddress").get(
+                "NewExternalIPAddress")
+        except Exception:
+            pass
+    if "common" in svcs:
+        for key, action, field in (
+                ("rx", "GetTotalBytesReceived", "NewTotalBytesReceived"),
+                ("tx", "GetTotalBytesSent", "NewTotalBytesSent")):
+            try:
+                out[key] = num(upnp_call(svcs["common"], action), field)
+            except Exception:
+                pass
+    return {k: v for k, v in out.items() if v is not None}
+
+
+def upnp_poller():
+    """Раз в UPNP_POLL_SEC спрашивает роутер по UPnP. Если роутер UPnP не
+    поддерживает или он выключен — проверка тихо не работает, повторяя
+    поиск раз в UPNP_RETRY_SEC."""
+    svcs, fails, told = None, 0, False
+    while not _stop:
+        t0 = time.time()
+        if svcs is None:
+            try:
+                loc = upnp_discover(GATEWAY)
+                svcs = upnp_services(loc) if loc else None
+                if svcs:
+                    log.info("upnp: найдено на %s (%s)", loc, ", ".join(sorted(svcs)))
+                    told = False
+                else:
+                    svcs = None
+            except Exception as e:
+                svcs = None
+                if not told:
+                    log.warning("upnp: ошибка поиска: %s", e)
+            if svcs is None:
+                if not told:
+                    log.warning("upnp: роутер %s не отвечает по UPnP — "
+                                "проверка не работает", GATEWAY)
+                    told = True
+                _pause(t0, UPNP_RETRY_SEC)
+                continue
+        try:
+            res = upnp_poll(svcs)
+            if res:
+                put_extra("upnp", res)
+            fails = 0
+        except Exception:
+            fails += 1
+            if fails >= 2:              # роутер перезагрузился — ищем заново
+                svcs, fails = None, 0
+        _pause(t0, UPNP_POLL_SEC)
+
+
+# ---- серия быстрых проб: замирания короче обычного интервала ----
+
+def burst_once():
+    host, port = BURST_TARGET
+    rtts, lost = [], 0
+    for _ in range(BURST_COUNT):
+        t0 = time.perf_counter()
+        d = tcp_check(host, port, timeout=BURST_TIMEOUT)
+        if d["ok"]:
+            rtts.append(d["rtt"])
+        else:
+            lost += 1
+        time.sleep(max(0.0, BURST_GAP - (time.perf_counter() - t0)))
+    res = {"n": BURST_COUNT, "lost": lost}
+    if rtts:
+        res["p50"] = round(statistics.median(rtts), 1)
+        res["max"] = round(max(rtts), 1)
+    return res
+
+
+def burst_prober():
+    while not _stop:
+        t0 = time.time()
+        try:
+            put_extra("burst", burst_once())
+        except Exception as e:
+            log.warning("burst probe failed: %s", e)
+        _pause(t0, BURST_SEC)
+
+
+# ---- состояние сервера: процессор, память, диск ----
+
+def _cpu_times():
+    with open("/proc/stat") as f:
+        v = [int(x) for x in f.readline().split()[1:]]
+    idle = v[3] + (v[4] if len(v) > 4 else 0)        # idle + iowait
+    return sum(v), idle
+
+
+def _mem_pct():
+    m = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            k, _, rest = line.partition(":")
+            m[k] = int(rest.split()[0])
+    total = m["MemTotal"]
+    avail = m.get("MemAvailable", m.get("MemFree", 0))
+    return 100.0 * (total - avail) / total, total * 1024
+
+
+def sys_sampler():
+    """Раз в SYS_SEC: средняя загрузка процессора за интервал, занятая
+    память, место на диске с данными и размер лога. В контейнере /proc
+    показывает значения всего сервера, а не одного контейнера."""
+    try:
+        prev = _cpu_times()
+    except Exception as e:
+        log.warning("sys stats disabled: %s", e)
+        return
+    while not _stop:
+        t0 = time.time()
+        _pause(t0, SYS_SEC)
+        if _stop:
+            break
+        try:
+            cur = _cpu_times()
+            dt, di = cur[0] - prev[0], cur[1] - prev[1]
+            prev = cur
+            mem, mem_total = _mem_pct()
+            st = os.statvfs(WORK_DIR)
+            res = {"cpu": round(100.0 * (dt - di) / dt, 1) if dt > 0 else 0.0,
+                   "mem": round(mem, 1), "mem_total": mem_total,
+                   "disk_total": st.f_frsize * st.f_blocks,
+                   "disk_free": st.f_frsize * st.f_bavail,
+                   "log": data_size()}
+            try:
+                with open("/proc/loadavg") as f:
+                    res["load"] = float(f.read().split()[0])
+            except Exception:
+                pass
+            put_extra("sys", res)
+        except Exception as e:
+            log.warning("sys stats failed: %s", e)
+
+
 # ---- подсчёт устройств в локальной сети ----
 
 _dev = {"n": None, "t": 0.0}
@@ -345,6 +654,7 @@ def device_scanner():
             found = arp_scan(iface, my_ip, my_mac)
             _dev["n"] = len(found)
             _dev["t"] = time.time()
+            put_extra("devs", {ip: mac.hex() for ip, mac in found.items()})
             failures = 0
         except PermissionError:
             log.warning("device scan disabled: нет прав на ARP "
@@ -362,6 +672,238 @@ def current_devices():
     if _dev["n"] is None or time.time() - _dev["t"] > DEVICE_SCAN_SEC * 3:
         return None
     return _dev["n"]
+
+
+# ---- хранение лога ----
+
+def day_file(d):
+    return f"{WORK_DIR}/netdiag-{d.isoformat()}.jsonl"
+
+
+def data_files():
+    """Файлы лога по порядку времени: [(дата или None для старого, путь)]."""
+    out = []
+    if os.path.exists(OUT_JSONL):
+        out.append((None, OUT_JSONL))
+    for path in sorted(glob.glob(f"{WORK_DIR}/netdiag-????-??-??.jsonl")):
+        try:
+            out.append((date.fromisoformat(os.path.basename(path)[8:18]), path))
+        except ValueError:
+            pass
+    return out
+
+
+def data_size():
+    n = 0
+    for _d, path in data_files():
+        try:
+            n += os.path.getsize(path)
+        except OSError:
+            pass
+    return n
+
+
+def purge_old(today):
+    """Удаляет файлы лога старше RETAIN_DAYS."""
+    limit = today - timedelta(days=RETAIN_DAYS)
+    for d, path in data_files():
+        try:
+            if d is None:
+                d = datetime.fromtimestamp(os.path.getmtime(path), TZ).date()
+            if d < limit:
+                os.remove(path)
+                log.info("удалён старый лог %s", os.path.basename(path))
+        except OSError as e:
+            log.warning("не удалось удалить %s: %s", path, e)
+
+
+# ---- журналы сервера: файрвол, входы по SSH, fail2ban ----
+
+def _log_files(name):
+    return sorted(p for p in glob.glob(f"{HOST_LOG_DIR}/{name}*")
+                  if os.path.isfile(p))
+
+
+def _log_lines(path):
+    opener = gzip.open if path.endswith(".gz") else open
+    try:
+        with opener(path, "rt", encoding="utf-8", errors="replace") as f:
+            yield from f
+    except OSError:
+        return
+
+
+def _newest(paths):
+    """Время последней записи в журнале: mtime самого свежего непустого файла."""
+    best = None
+    for path in paths:
+        try:
+            if os.path.getsize(path) > 0:
+                m = os.path.getmtime(path)
+                best = m if best is None or m > best else best
+        except OSError:
+            pass
+    return datetime.fromtimestamp(best, TZ) if best else None
+
+
+def _host_tz():
+    """Часовой пояс самого сервера: в нём fail2ban пишет время в свой журнал.
+    Контейнер живёт в TZ, а /etc/localtime у него подключён от сервера."""
+    try:
+        with open("/etc/localtime", "rb") as f:
+            return ZoneInfo.from_file(f)
+    except Exception:
+        return TZ
+
+
+_UFW_FIELD = re.compile(r"\b(IN|OUT|SRC|DST|PROTO|DPT)=(\S*)")
+
+
+def security_summary(t_from, t_to):
+    """Блокировки файрвола, входы по SSH и срабатывания fail2ban за период.
+    None — журналы сервера контейнеру недоступны."""
+    if not os.path.isdir(HOST_LOG_DIR):
+        return None
+    R = {"ufw_in": 0, "ufw_out": 0, "ufw_noise": 0,
+         "top_in": Counter(), "top_out": Counter(), "ssh_ok": 0, "ssh_fail": 0,
+         "found": 0, "ban": 0, "ips": Counter(), "banned": Counter(),
+         "syslog_stale": False, "syslog_last": None, "f2b": False}
+    fresh_from = t_from.timestamp() - 86400
+
+    def in_period(ts):
+        return ts is not None and t_from <= ts <= t_to
+
+    def iso(line):
+        try:
+            return datetime.fromisoformat(line[:40].split(" ", 1)[0]).astimezone(TZ)
+        except ValueError:
+            return None
+
+    auth, ufw = _log_files("auth.log"), _log_files("ufw.log")
+    last = _newest(auth)
+    R["syslog_last"] = last
+    R["syslog_stale"] = (last is None
+                         or (now() - last).total_seconds() > SEC_STALE_DAYS * 86400)
+    for paths, kind in ((ufw, "ufw"), (auth, "auth")):
+        for path in paths:
+            try:
+                if os.path.getsize(path) == 0 or os.path.getmtime(path) < fresh_from:
+                    continue
+            except OSError:
+                continue
+            for line in _log_lines(path):
+                if kind == "ufw":
+                    if "[UFW BLOCK]" not in line or not in_period(iso(line)):
+                        continue
+                    f = dict(m.groups() for m in _UFW_FIELD.finditer(line))
+                    dst = f.get("DST", "")
+                    first = dst.split(".", 1)[0]
+                    if (dst.lower().startswith("ff") or dst == "255.255.255.255"
+                            or dst.endswith(".255")
+                            or (first.isdigit() and 224 <= int(first) <= 239)):
+                        R["ufw_noise"] += 1      # групповые и широковещательные
+                        continue
+                    if f.get("PROTO") == "TCP" and " SYN " not in line:
+                        R["ufw_noise"] += 1      # хвост уже закрытого соединения
+                        continue
+                    what = (f"порт {f['DPT']}" if f.get("DPT")
+                            else f.get("PROTO", "?"))
+                    if f.get("IN"):
+                        R["ufw_in"] += 1
+                        R["top_in"][f"{f.get('SRC', '?')} → {what}"] += 1
+                    else:
+                        R["ufw_out"] += 1
+                        R["top_out"][f"{dst} → {what}"] += 1
+                elif "sshd" in line:
+                    if "Accepted " in line:
+                        if in_period(iso(line)):
+                            R["ssh_ok"] += 1
+                    elif ("Invalid user " in line
+                          or ("Failed password for " in line
+                              and "invalid user" not in line)
+                          or "Failed publickey for " in line):
+                        if in_period(iso(line)):
+                            R["ssh_fail"] += 1
+    f2b = _log_files("fail2ban.log")
+    R["f2b"] = bool(f2b)
+    host_tz = _host_tz()
+    for path in f2b:
+        try:
+            if os.path.getsize(path) == 0 or os.path.getmtime(path) < fresh_from:
+                continue
+        except OSError:
+            continue
+        for line in _log_lines(path):
+            what = "found" if "] Found " in line else "ban" if "] Ban " in line else None
+            if not what:
+                continue
+            try:
+                ts = datetime.strptime(line[:19], "%Y-%m-%d %H:%M:%S").replace(
+                    tzinfo=host_tz)
+            except ValueError:
+                continue
+            if not in_period(ts):
+                continue
+            R[what] += 1
+            ip = line.split("] Found " if what == "found" else "] Ban ", 1)[1].split()[0]
+            (R["ips"] if what == "found" else R["banned"])[ip] += 1
+    return R
+
+
+def _top(counter, word, n=2):
+    if not counter:
+        return ""
+    return f" ({word}: " + ", ".join(f"{k} ×{v}" for k, v in counter.most_common(n)) + ")"
+
+
+def security_lines(R):
+    """Строки о безопасности на двух языках: [{'ru':…, 'az':…}]."""
+    if R is None:
+        return []
+    out = []
+    if R["syslog_stale"]:
+        when = (fmt_dt(R["syslog_last"])[:8] if R["syslog_last"] else None)
+        out.append({
+            "ru": ("Системные журналы сервера (auth.log, ufw.log) "
+                   + (f"не пополняются с {when}" if when else "не ведутся")
+                   + ": блокировки файрвола и входы по SSH не учитываются. "
+                   "Проверить службу rsyslog."),
+            "az": ("Serverin sistem jurnalları (auth.log, ufw.log) "
+                   + (f"{when} tarixindən yenilənmir" if when else "aparılmır")
+                   + ": faervol bloklamaları və SSH girişləri nəzərə alınmır. "
+                   "rsyslog xidmətini yoxlamaq lazımdır.")})
+    else:
+        out.append({
+            "ru": f"Файрвол заблокировал адресных пакетов: входящих {R['ufw_in']}"
+                  + _top(R["top_in"], "чаще всего")
+                  + f", исходящих {R['ufw_out']}" + _top(R["top_out"], "чаще всего")
+                  + f". Служебных рассылок и хвостов закрытых соединений: "
+                    f"{R['ufw_noise']} — это не атаки.",
+            "az": f"Faervol ünvanlı paketləri bloklayıb: daxil olan {R['ufw_in']}"
+                  + _top(R["top_in"], "ən çox").replace("порт", "port")
+                  + f", çıxan {R['ufw_out']}"
+                  + _top(R["top_out"], "ən çox").replace("порт", "port")
+                  + f". Xidməti yayım paketləri və bağlanmış əlaqələrin qalıqları: "
+                    f"{R['ufw_noise']} — bunlar hücum deyil."})
+        out.append({
+            "ru": f"Входов по SSH: удачных {R['ssh_ok']}, неудачных {R['ssh_fail']}.",
+            "az": f"SSH girişləri: uğurlu {R['ssh_ok']}, uğursuz {R['ssh_fail']}."})
+    if R["f2b"]:
+        ips = ", ".join(f"{ip} ×{n}" for ip, n in R["ips"].most_common(3))
+        bans = ", ".join(ip for ip, _n in R["banned"].most_common(3))
+        out.append({
+            "ru": f"fail2ban: неудачных попыток входа {R['found']}"
+                  + (f" (с адресов: {ips})" if ips else "")
+                  + f", заблокировано адресов: {R['ban']}"
+                  + (f" ({bans})" if bans else "") + ".",
+            "az": f"fail2ban: uğursuz giriş cəhdləri {R['found']}"
+                  + (f" (ünvanlar: {ips})" if ips else "")
+                  + f", bloklanmış ünvanlar: {R['ban']}"
+                  + (f" ({bans})" if bans else "") + "."})
+    else:
+        out.append({"ru": "fail2ban: журнал не найден.",
+                    "az": "fail2ban: jurnal tapılmadı."})
+    return out
 
 
 def write_heartbeat():
@@ -395,19 +937,37 @@ def run():
              INTERVAL_SEC, len(TARGETS), DEVICE_SCAN)
     if DEVICE_SCAN:
         threading.Thread(target=device_scanner, daemon=True).start()
-    with open(OUT_JSONL, "a", buffering=1, encoding="utf-8") as f:
+    if UPNP_POLL:
+        threading.Thread(target=upnp_poller, daemon=True).start()
+    if BURST_PROBE:
+        threading.Thread(target=burst_prober, daemon=True).start()
+    if SYS_STATS:
+        threading.Thread(target=sys_sampler, daemon=True).start()
+    f, cur_day = None, None
+    try:
         while not _stop:
             t0 = time.time()
             write_heartbeat()
-            rec = {"ts": now().isoformat(timespec="milliseconds"),
+            stamp = now()
+            if stamp.date() != cur_day:           # новые сутки — новый файл
+                if f:
+                    f.close()
+                cur_day = stamp.date()
+                purge_old(cur_day)
+                f = open(day_file(cur_day), "a", buffering=1, encoding="utf-8")
+            rec = {"ts": stamp.isoformat(timespec="milliseconds"),
                    "data": sample_all()}
             dev = current_devices()
             if dev is not None:
                 rec["ndev"] = dev
+            rec.update(take_extras())     # devs / upnp / burst / sys, раз в минуту
             f.write(json.dumps(rec) + "\n")
             f.flush()
             os.fsync(f.fileno())
             time.sleep(max(0, INTERVAL_SEC - (time.time() - t0)))
+    finally:
+        if f:
+            f.close()
     log.info("STOP")
     _pool.shutdown(wait=False, cancel_futures=True)
 
@@ -500,6 +1060,12 @@ def _stat():
             "rtt": array("f"), "ext": array("f"),
             "dns_try": 0, "dns_lost": 0, "ctl_try": 0, "ctl_lost": 0,
             "dnsc_try": 0, "dnsc_lost": 0,   # DNS роутера там, где есть контроль
+            "join": 0, "left": 0, "scans": 0,          # смена состава устройств
+            "rx_bits": 0.0, "tx_bits": 0.0, "tr_sec": 0.0,   # трафик по UPnP
+            "b_n": 0, "b_lost": 0,                      # серии быстрых проб
+            "b_p50": array("f"), "b_max": array("f"),
+            "cpu_sum": 0.0, "mem_sum": 0.0, "sys_n": 0,      # сервер
+            "cpu_max": 0.0, "mem_max": 0.0,
             "dev_sum": 0, "dev_n": 0, "dev_max": 0, "outages": 0}
 
 
@@ -533,12 +1099,23 @@ class Analyzer:
         self.pre = deque(maxlen=60)       # RTT роутера за ~5 минут до события
         self.last_dev = None
         self.rdns_n = self.rdns_ok = 0     # DNS роутера: замеров / успешных
+        self.upnp_n = 0                    # опросов роутера по UPnP
+        self.up_prev = None
+        self.wan_resets = []               # (когда, сколько держалось до этого)
+        self.ip_changes = []
+        self.wan_down_polls = 0
+        self.devtab = {}                   # mac → сведения об устройстве
+        self.dv_prev, self.dv_ts, self.dv_scans = {}, None, 0
+        self.drops = []                    # (когда, пропало, из скольких, вернулось)
+        self.dv_pending = []               # отключения, ждущие проверки на возврат
+        self.sys_first = self.sys_last = None    # (когда, запись) о сервере
 
     @property
     def has_rdns(self):
         return self.rdns_ok > 0
 
-    def feed(self, ts, data, dev):
+    def feed(self, ts, data, dev, rec=None):
+        self._extras(ts, rec)
         c = classify(data, self.rdns_ok > 0)
         if c["rdns"] is not None:
             self.rdns_n += 1
@@ -556,6 +1133,121 @@ class Analyzer:
             else:
                 self._account(self.prev, dt if dt > 0 else INTERVAL_SEC, False)
         self.prev = c
+
+    # ---------- дополнительные данные из замера ----------
+
+    def _extras(self, ts, rec):
+        if not rec:
+            return
+        spots = (self.total, self.tl[tl_key(ts)])
+        y = rec.get("sys")
+        if y and y.get("cpu") is not None:
+            if self.sys_first is None:
+                self.sys_first = (ts, y)
+            self.sys_last = (ts, y)
+            for s in spots:
+                s["cpu_sum"] += y["cpu"]
+                s["mem_sum"] += y.get("mem", 0.0)
+                s["sys_n"] += 1
+                s["cpu_max"] = max(s["cpu_max"], y["cpu"])
+                s["mem_max"] = max(s["mem_max"], y.get("mem", 0.0))
+        b = rec.get("burst")
+        if b:
+            for s in spots:
+                s["b_n"] += b.get("n", 0)
+                s["b_lost"] += b.get("lost", 0)
+                if b.get("p50") is not None:
+                    s["b_p50"].append(b["p50"])
+                    s["b_max"].append(b.get("max", b["p50"]))
+        u = rec.get("upnp")
+        if u:
+            self._upnp(ts, u, spots)
+        devs = rec.get("devs")
+        if devs and USE_DEVICE_COUNT:
+            self._devs(ts, devs, spots)
+
+    def _upnp(self, ts, u, spots):
+        self.upnp_n += 1
+        p = self.up_prev
+        self.up_prev = dict(u, ts=ts)
+        if u.get("st") and u["st"] != "Connected":
+            self.wan_down_polls += 1
+        if not p:
+            return
+        dt = (ts - p["ts"]).total_seconds()
+        if not 0 < dt <= 7200:
+            return
+        # время соединения стало меньше, чем было: соединение переустановлено
+        reset = (u.get("up") is not None and p.get("up") is not None
+                 and u["up"] + 30 < p["up"] + dt)
+        reset = reset and u["up"] < p["up"]
+        if reset:
+            self.wan_resets.append((ts, p["up"]))
+        if u.get("ip") and p.get("ip") and u["ip"] != p["ip"]:
+            self.ip_changes.append((ts, p["ip"], u["ip"]))
+        if reset or dt > 300:
+            return                        # счётчики байт несопоставимы
+        got = False
+        for key, dst in (("rx", "rx_bits"), ("tx", "tx_bits")):
+            if u.get(key) is None or p.get(key) is None:
+                continue
+            d = u[key] - p[key]
+            if d < 0:
+                d += 2 ** 32             # 32-битный счётчик перешёл через ноль
+            if d * 8 / dt > 1.5e9:       # неправдоподобно — пропускаем
+                continue
+            got = True
+            for s in spots:
+                s[dst] += d * 8
+        if got:
+            for s in spots:
+                s["tr_sec"] += dt
+
+    def _devs(self, ts, devs, spots):
+        cur = {mac: ip for ip, mac in devs.items()}
+        fresh = (self.dv_ts is None
+                 or (ts - self.dv_ts).total_seconds() > 300)
+        self.dv_scans += 1
+        for mac, ip in cur.items():
+            d = self.devtab.get(mac)
+            if d is None:
+                d = self.devtab[mac] = {"ip": ip, "n": 0, "last": None,
+                                        "miss": 0, "abs": []}
+            if d["miss"] >= 2 and d["last"] is not None and not fresh:
+                d["abs"].append((d["last"], ts))
+            d["miss"] = 0
+            d["n"] += 1
+            d["last"] = ts
+            d["ip"] = ip
+        for mac, d in self.devtab.items():
+            if mac in cur:
+                continue
+            if fresh:
+                d["miss"], d["last"] = 0, None   # через перерыв не считаем
+            elif d["last"] is not None:
+                d["miss"] += 1
+        if fresh:
+            self.dv_pending = []
+        for pd in self.dv_pending[:]:
+            pd["back"] |= pd["macs"] & cur.keys()
+            pd["wait"] -= 1
+            if pd["wait"] <= 0:
+                self.dv_pending.remove(pd)
+                if len(pd["back"]) >= DROP_BACK_SHARE * len(pd["macs"]):
+                    self.drops.append((pd["ts"], len(pd["macs"]), pd["tot"],
+                                       len(pd["back"])))
+        if not fresh:
+            gone = self.dv_prev.keys() - cur.keys()
+            joined = len(cur.keys() - self.dv_prev.keys())
+            for s in spots:
+                s["join"] += joined
+                s["left"] += len(gone)
+                s["scans"] += 1
+            if len(gone) >= max(DROP_MIN, DROP_SHARE * len(self.dv_prev)):
+                self.dv_pending.append({"ts": ts, "macs": set(gone), "back": set(),
+                                        "tot": len(self.dv_prev),
+                                        "wait": DROP_BACK_SCANS})
+        self.dv_prev, self.dv_ts = cur, ts
 
     def finish(self):
         if self.prev is not None:
@@ -774,6 +1466,109 @@ def outage_verdict(e, base):
             "etmək mümkün deyil")
 
 
+VM_OUI = ("005056", "000c29", "000569", "001c14")      # VMware
+
+
+def mac_fmt(m):
+    return ":".join(m[i:i + 2] for i in range(0, 12, 2))
+
+
+def dev_label(mac, ip, lang="ru"):
+    tag = ""
+    if ip == GATEWAY:
+        tag = {"ru": ", главный роутер", "az": ", əsas router"}[lang]
+    elif mac[:6] in VM_OUI:
+        tag = {"ru": ", виртуальная машина", "az": ", virtual maşın"}[lang]
+    return f"{ip} ({mac_fmt(mac)}{tag})"
+
+
+def fmt_bytes(n, lang="ru"):
+    units = {"ru": ("МБ", "ГБ"), "az": ("MB", "GB")}[lang]
+    if n >= 1024 ** 3:
+        return f"{n / 1024 ** 3:.1f} {units[1]}".replace(".", ",")
+    return f"{n / 1024 ** 2:.0f} {units[0]}"
+
+
+def server_summary(A):
+    """Состояние сервера: диск с рекомендацией и прогнозом по росту лога."""
+    if A.sys_last is None:
+        return None
+    ts, y = A.sys_last
+    total, free = y.get("disk_total", 0), y.get("disk_free", 0)
+    if not total:
+        return None
+    used = total - free
+    pct_used = 100.0 * used / total
+    level = ("crit" if pct_used >= DISK_CRIT_PCT else
+             "warn" if pct_used >= DISK_WARN_PCT else "ok")
+    state = {"ok": {"ru": "места достаточно", "az": "yer kifayətdir"},
+             "warn": {"ru": "место заканчивается", "az": "yer azalır"},
+             "crit": {"ru": "диск почти заполнен",
+                      "az": "disk demək olar ki, dolub"}}[level]
+    rec = {"ok": {"ru": "Действий не требуется.",
+                  "az": "Heç bir tədbir tələb olunmur."},
+           "warn": {"ru": "В ближайшие недели стоит почистить диск или "
+                          "расширить его.",
+                    "az": "Yaxın həftələrdə diski təmizləmək və ya "
+                          "genişləndirmək lazımdır."},
+           "crit": {"ru": "Нужно почистить или расширить диск сейчас, иначе "
+                          "сервер и сбор данных остановятся.",
+                    "az": "Diski indi təmizləmək və ya genişləndirmək lazımdır, "
+                          "əks halda server və məlumat toplanması dayanacaq."}}[level]
+    out = {"total": total, "free": free, "used": used, "pct": round(pct_used, 1),
+           "level": level, "state": state, "rec": rec, "log": None,
+           "line": both(lambda lg: (
+               f"Занято {fmt_bytes(used)} из {fmt_bytes(total)} "
+               f"({pct_used:.0f}%), свободно {fmt_bytes(free)}" if lg == "ru" else
+               f"{fmt_bytes(total, 'az')}-dan {fmt_bytes(used, 'az')} tutulub "
+               f"({pct_used:.0f}%), {fmt_bytes(free, 'az')} boşdur"))}
+    t0, y0 = A.sys_first
+    span = (ts - t0).total_seconds()
+    grow = y.get("log", 0) - y0.get("log", 0)
+    if span >= 3600 and grow > 0:
+        per_day = grow / span * 86400
+        cap = per_day * RETAIN_DAYS              # сколько займёт лог за весь срок
+        fits = cap - y.get("log", 0) < free
+        out["log"] = {
+            "ru": f"Лог диагностики занимает {fmt_bytes(y['log'])} и растёт "
+                  f"примерно на {fmt_bytes(per_day)} в сутки. Хранятся последние "
+                  f"{RETAIN_DAYS} дней, поэтому он займёт не больше "
+                  f"≈{fmt_bytes(cap)}"
+                  + (" — места достаточно." if fits else
+                     " — столько свободного места нет: нужно уменьшить срок "
+                     "хранения (RETAIN_DAYS)."),
+            "az": f"Diaqnostika jurnalı {fmt_bytes(y['log'], 'az')} yer tutur və "
+                  f"sutkada təxminən {fmt_bytes(per_day, 'az')} artır. Son "
+                  f"{RETAIN_DAYS} gün saxlanılır, ona görə də o, təxminən "
+                  f"{fmt_bytes(cap, 'az')}-dan çox yer tutmayacaq"
+                  + (" — yer kifayətdir." if fits else
+                     " — bu qədər boş yer yoxdur: saxlama müddətini azaltmaq "
+                     "lazımdır (RETAIN_DAYS).")}
+    return out
+
+
+def extra_findings(A):
+    """Итоги дополнительных проверок в виде, общем для текста и HTML."""
+    mute = [(e["start"] - timedelta(minutes=5), e["end"] + timedelta(minutes=15))
+            for e in A.events if e.get("gw_down", 0) > 0]
+    resets = [{"ts": ts, "up": up, "reboot": any(a <= ts <= b for a, b in mute)}
+              for ts, up in A.wan_resets]
+    infra, n_infra = [], 0
+    if A.dv_scans >= INFRA_MIN_SCANS:
+        for mac, d in A.devtab.items():
+            if d["n"] < INFRA_SHARE * A.dv_scans:
+                continue
+            n_infra += 1
+            gone = list(d["abs"])
+            if d["miss"] >= 2 and d["last"] is not None:
+                gone.append((d["last"], None))
+            for st, en in gone:
+                infra.append({"mac": mac, "ip": d["ip"], "start": st, "end": en})
+    infra.sort(key=lambda x: x["start"])
+    return {"resets": resets, "infra": infra, "n_infra": n_infra,
+            "drops": A.drops, "ip_changes": A.ip_changes}
+
+
 def render(A):
     L = []
     T = A.total
@@ -821,6 +1616,9 @@ def render(A):
     if with_dev:
         L.append(f"  Раз в {DEVICE_SCAN_SEC} сек считалось число устройств в сети {LAN_NET}")
         L.append("  (по ответам на ARP-запросы сервера; в число входят серверы и роутеры).")
+        if HIDDEN_SUBNETS:
+            L.append(f"  Устройства за дополнительным роутером ({', '.join(HIDDEN_SUBNETS)})")
+            L.append("  серверу не видны: реальное число устройств больше.")
     else:
         L.append("  Числа устройств в этих данных нет — нагрузка оценивается по")
         L.append("  времени суток.")
@@ -895,6 +1693,68 @@ def render(A):
         "  роутеру, оставшихся без ответа; контр. — то же для запросов напрямую",
         "  к 8.8.8.8; обрывов — число полных обрывов.",
     ]
+
+    # ---------- дополнительные проверки ----------
+    F = A.findings = extra_findings(A)
+    X = []
+    if A.upnp_n:
+        X.append(f"  Роутер по UPnP опрошен {A.upnp_n} раз.")
+        X.append(f"    Переустановок соединения с провайдером: {len(F['resets'])}")
+        for r in F["resets"][:MAX_EVENTS_LISTED]:
+            X += wrap(f"{fmt_dt(r['ts'])} (до этого держалось {fmt_dur(r['up'])}) — "
+                      + ("роутер пропадал из локальной сети: перезагрузка роутера"
+                         if r["reboot"] else
+                         "роутер по локальной сети отвечал: переподключилась линия"),
+                      76, "      ", "        ")
+        if F["ip_changes"]:
+            X.append(f"    Смен внешнего адреса: {len(F['ip_changes'])}")
+        if A.wan_down_polls:
+            X.append(f"    Опросов, когда роутер сообщал «нет соединения»: {A.wan_down_polls}")
+        if T["tr_sec"]:
+            X.append(f"    Трафик в среднем: к нам {T['rx_bits'] / T['tr_sec'] / 1e6:.1f} Мбит/с, "
+                     f"от нас {T['tx_bits'] / T['tr_sec'] / 1e6:.1f} Мбит/с.")
+    if T["b_n"]:
+        X += wrap(f"Серии быстрых проб ({BURST_COUNT} подключений подряд раз в "
+                  f"{BURST_SEC} сек): потеряно {T['b_lost']} из {T['b_n']} "
+                  f"({pct(T['b_lost'], T['b_n']):.2f}%); худшая задержка "
+                  f"{ms(max(T['b_max']) if T['b_max'] else None)} мс.", 76, "  ", "    ")
+    if A.dv_scans:
+        X.append(f"  Состав устройств: замечено разных — {len(A.devtab)}, "
+                 f"постоянных — {F['n_infra']}.")
+        X.append(f"    Постоянные устройства пропадали из сети: {len(F['infra'])}")
+        for i in F["infra"][:MAX_EVENTS_LISTED]:
+            till = (f"по {fmt_dt(i['end'])} ({fmt_dur((i['end'] - i['start']).total_seconds())})"
+                    if i["end"] else "и до конца периода не вернулось")
+            X += wrap(f"{dev_label(i['mac'], i['ip'])}: с {fmt_dt(i['start'])} {till}",
+                      76, "      ", "        ")
+        X.append(f"    Массовых отключений с возвратом устройств: {len(F['drops'])}")
+        for ts, left, tot, back in F["drops"][:MAX_EVENTS_LISTED]:
+            X.append(f"      {fmt_dt(ts)}: пропало {left} из {tot}, "
+                     f"вернулось {back} за {DROP_BACK_SCANS} мин")
+    SV = A.server = server_summary(A)
+    if T["sys_n"]:
+        L.append("СЕРВЕР ДИАГНОСТИКИ")
+        L.append(f"  Процессор: в среднем {T['cpu_sum'] / T['sys_n']:.0f}%, "
+                 f"максимум {T['cpu_max']:.0f}%.")
+        L.append(f"  Память: в среднем {T['mem_sum'] / T['sys_n']:.0f}%, "
+                 f"максимум {T['mem_max']:.0f}%.")
+        if SV:
+            L += wrap(f"Диск: {SV['line']['ru'][0].lower()}{SV['line']['ru'][1:]} — "
+                      f"{SV['state']['ru']}. {SV['rec']['ru']}", 76, "  ", "    ")
+            if SV["log"]:
+                L += wrap(SV["log"]["ru"], 76, "  ", "    ")
+        L.append("")
+    SEC = getattr(A, "security", None)
+    A.sec_lines = security_lines(SEC)
+    if A.sec_lines:
+        L.append("БЕЗОПАСНОСТЬ СЕРВЕРА (за период отчёта)")
+        for ln in A.sec_lines:
+            L += wrap(ln["ru"], 76, "  ", "    ")
+        L.append("")
+    if X:
+        L.append("ДОПОЛНИТЕЛЬНЫЕ ПРОВЕРКИ")
+        L += X
+        L.append("")
 
     # ---------- по числу устройств ----------
     if with_dev:
@@ -980,7 +1840,8 @@ def render(A):
         C.append(ru)
         CA.append(az)
 
-    if not A.events and T["bad"] == 0:
+    if (not A.events and T["bad"] == 0
+            and not (F["resets"] or F["infra"] or F["drops"])):
         say("По проводу сбоев не зафиксировано. Если жалобы в этот период "
             "были, их причина в беспроводной части сети, которую этот "
             "замер не видит.",
@@ -1001,12 +1862,22 @@ def render(A):
         if dns_sure:
             bits.append(f"{len(dns_sure)} — отказы DNS роутера, при которых "
                         "контрольный DNS-запрос мимо роутера проходил "
-                        "(для устройств, получающих DNS от роутера, это выглядит "
-                        "как пропавший интернет)")
+                        + ("(для устройств, получающих DNS от роутера, это "
+                           "выглядит как пропавший интернет)"
+                           if CLIENTS_USE_ROUTER_DNS else
+                           "(устройства академии получают DNS 8.8.8.8 и роутер "
+                           "обходят, людей это не задевает; это показатель "
+                           "состояния самого роутера)"))
             bits_az.append(f"{len(dns_sure)} — routerin DNS-i cavab vermədiyi, "
                            "lakin routerdən yan keçən nəzarət DNS sorğusunun "
-                           "keçdiyi hallar (DNS-i routerdən alan cihazlar üçün "
-                           "bu, internetin itməsi kimi görünür)")
+                           "keçdiyi hallar "
+                           + ("(DNS-i routerdən alan cihazlar üçün bu, "
+                              "internetin itməsi kimi görünür)"
+                              if CLIENTS_USE_ROUTER_DNS else
+                              "(akademiyanın cihazları DNS kimi 8.8.8.8 alır və "
+                              "routerin DNS-indən istifadə etmir, insanlara bu "
+                              "təsir etmir; bu, routerin öz vəziyyətinin "
+                              "göstəricisidir)"))
         if mute_ev:
             bits.append(f"{len(mute_ev)} — роутер переставал отвечать на локальные "
                         "запросы при работающем интернете")
@@ -1158,6 +2029,66 @@ def render(A):
                     f"{d_hi:.2f}% {hi_name} и {d_lo:.2f}% {lo_name}.",
                     f"Routerin DNS itkiləri yüklənmədən asılı deyil: "
                     f"{hi_az} {d_hi:.2f}%, {lo_az} {d_lo:.2f}%.")
+    if F["resets"]:
+        nr = sum(1 for r in F["resets"] if r["reboot"])
+        nw = len(F["resets"]) - nr
+        say(f"Счётчик соединения роутера с провайдером обнулялся "
+            f"{plural(len(F['resets']), 'раз', 'раза', 'раз')}: {nr} — вместе с пропаданием роутера из "
+            f"локальной сети (перезагрузка роутера), {nw} — при отвечающем "
+            "роутере (переподключение линии провайдера).",
+            f"Routerin provayderlə əlaqə sayğacı {len(F['resets'])} dəfə "
+            f"sıfırlanıb: {nr} dəfə router lokal şəbəkədən itməklə birlikdə "
+            f"(routerin yenidən yüklənməsi), {nw} dəfə router cavab verərkən "
+            "(provayder xəttinin yenidən qoşulması).")
+    if F["infra"]:
+        say(f"Постоянные устройства сети пропадали "
+            f"{plural(len(F['infra']), 'раз', 'раза', 'раз')} "
+            "(список в событиях). Если среди них точки доступа, в это время "
+            "их зона оставалась без Wi-Fi.",
+            f"Şəbəkənin daimi cihazları {len(F['infra'])} dəfə itib (siyahı "
+            "hadisələrdədir). Onların arasında giriş nöqtələri varsa, həmin "
+            "vaxt onların əhatə zonası Wi-Fi-sız qalıb.")
+    if F["drops"]:
+        say(f"Массовых отключений устройств: {len(F['drops'])}. Много устройств "
+            "одновременно пропало и вскоре вернулось — признак того, что "
+            "точка доступа сбросила клиентов.",
+            f"Cihazların kütləvi ayrılması: {len(F['drops'])}. Bir çox cihazın "
+            "eyni anda itib tezliklə qayıtması giriş nöqtəsinin müştəriləri "
+            "atmasının əlamətidir.")
+    if T["b_n"] and pct(T["b_lost"], T["b_n"]) >= 0.5:
+        bl = pct(T["b_lost"], T["b_n"])
+        say(f"В сериях быстрых проб потеряно {bl:.2f}% подключений: есть "
+            "короткие замирания, которые обычный замер раз в "
+            f"{INTERVAL_SEC} секунд не ловит.",
+            f"Sürətli yoxlama seriyalarında itən qoşulmaların payı {bl:.2f}%: "
+            f"{INTERVAL_SEC} saniyədə bir aparılan adi ölçmənin tutmadığı "
+            "qısa donmalar var.")
+    if SEC and SEC["syslog_stale"]:
+        when = fmt_dt(SEC["syslog_last"])[:8] if SEC["syslog_last"] else None
+        say("Системные журналы сервера "
+            + (f"не пополняются с {when}" if when else "не ведутся")
+            + ": блокировки файрвола и входы по SSH нигде не записываются в "
+            "файлы. Стоит включить службу rsyslog.",
+            "Serverin sistem jurnalları "
+            + (f"{when} tarixindən yenilənmir" if when else "aparılmır")
+            + ": faervol bloklamaları və SSH girişləri fayllara yazılmır. "
+            "rsyslog xidmətini işə salmaq lazımdır.")
+    if SEC and SEC["ban"]:
+        bans = ", ".join(ip for ip, _n in SEC["banned"].most_common(5))
+        say(f"fail2ban заблокировал адресов за подбор пароля: {SEC['ban']} ({bans}).",
+            f"fail2ban parol seçmə cəhdinə görə bloklanan ünvanlar: {SEC['ban']} ({bans}).")
+    if SV and SV["level"] != "ok":
+        say(f"Диск сервера: {SV['state']['ru']} ({SV['pct']:.0f}% занято). "
+            + SV["rec"]["ru"],
+            f"Serverin diski: {SV['state']['az']} ({SV['pct']:.0f}% tutulub). "
+            + SV["rec"]["az"])
+    if T["sys_n"] and (T["cpu_sum"] / T["sys_n"] >= 70 or T["mem_sum"] / T["sys_n"] >= 85):
+        say(f"Сервер диагностики сам загружен: процессор в среднем "
+            f"{T['cpu_sum'] / T['sys_n']:.0f}%, память {T['mem_sum'] / T['sys_n']:.0f}%. "
+            "Замеры задержек в такие периоды могут быть завышены.",
+            f"Diaqnostika serverinin özü yüklənib: prosessor orta hesabla "
+            f"{T['cpu_sum'] / T['sys_n']:.0f}%, yaddaş {T['mem_sum'] / T['sys_n']:.0f}%. "
+            "Belə dövrlərdə gecikmə ölçmələri şişirdilmiş ola bilər.")
     if n_unknown:
         say(f"{plural(n_unknown, 'обрыв', 'обрыва', 'обрывов')} этим замером нельзя отнести ни к роутеру, "
             "ни к провайдеру: роутер отвечал нормально, а трафик наружу не "
@@ -1182,7 +2113,11 @@ def render(A):
     L.append("ЧЕГО ЭТОТ ОТЧЁТ НЕ ПОКАЗЫВАЕТ")
     L += wrap("- Качество Wi-Fi по комнатам: сервер подключён проводом. Для этого "
               "нужен такой же замер с устройства, подключённого по Wi-Fi.", 76, "  ", "    ")
-    L += wrap(f"- Замирания короче {INTERVAL_SEC} секунд: они попадают между замерами.",
+    if HIDDEN_SUBNETS:
+        L += wrap(f"- Устройства и сбои за дополнительным роутером (подсеть "
+                  f"{', '.join(HIDDEN_SUBNETS)}): сервер стоит в основной сети и "
+                  "видит только её.", 76, "  ", "    ")
+    L += wrap(f"- Замирания короче {INTERVAL_SEC} секунд между сериями быстрых проб.",
               76, "  ", "    ")
     L += wrap("- Скорость: проверяется доступность и задержка, а не пропускная "
               "способность.", 76, "  ", "    ")
@@ -1224,10 +2159,12 @@ def _merge(stats):
     m = _stat()
     for s in stats:
         for k in ("n", "bad", "sec", "black_sec", "dns_try", "dns_lost",
-                  "ctl_try", "ctl_lost", "dev_sum", "dev_n"):
+                  "ctl_try", "ctl_lost", "dev_sum", "dev_n",
+                  "join", "left", "scans", "rx_bits", "tx_bits", "tr_sec",
+                  "b_n", "b_lost", "cpu_sum", "mem_sum", "sys_n"):
             m[k] += s[k]
-        m["rtt"].extend(s["rtt"])
-        m["ext"].extend(s["ext"])
+        for k in ("rtt", "ext", "b_p50", "b_max"):
+            m[k].extend(s[k])
     return m
 
 
@@ -1266,6 +2203,14 @@ def build_timeline(A):
             "rm": _r(quantile(m["rtt"], 0.5), 1), "r95": _r(quantile(m["rtt"], 0.95), 1),
             "em": _r(quantile(m["ext"], 0.5), 1), "e95": _r(quantile(m["ext"], 0.95), 1),
             "dev": _r(m["dev_sum"] / m["dev_n"], 1) if m["dev_n"] else None,
+            "join": _r(m["join"] / m["scans"], 2) if m["scans"] else None,
+            "left": _r(m["left"] / m["scans"], 2) if m["scans"] else None,
+            "rx": _r(m["rx_bits"] / m["tr_sec"] / 1e6, 2) if m["tr_sec"] else None,
+            "tx": _r(m["tx_bits"] / m["tr_sec"] / 1e6, 2) if m["tr_sec"] else None,
+            "bp50": _r(quantile(m["b_p50"], 0.5), 1),
+            "bmax": _r(max(m["b_max"]), 1) if m["b_max"] else None,
+            "cpu": _r(m["cpu_sum"] / m["sys_n"], 1) if m["sys_n"] else None,
+            "mem": _r(m["mem_sum"] / m["sys_n"], 1) if m["sys_n"] else None,
         })
 
     start_sec = b0 * per * TL_STEP_SEC
@@ -1350,6 +2295,7 @@ def render_html(A, text_report):
                               f"({e['ctl_try']} sorğudan {e['ctl_lost']})"}
         black = e["sec"]["blackout"]
         events.append({
+            "t": e["start"],
             "a": round(pos(e["start"]), 3), "b": round(pos(e["end"]), 3),
             "start": fmt_dt(e["start"]),
             "dur": {
@@ -1362,6 +2308,54 @@ def render_html(A, text_report):
             "kind": EVENT_KINDS[e["kind"]],
             "note": {k: _cap(v) for k, v in note.items()},
         })
+    F = getattr(A, "findings", None) or extra_findings(A)
+    for r in F["resets"]:
+        events.append({
+            "t": r["ts"], "a": round(pos(r["ts"]), 3), "b": round(pos(r["ts"]), 3),
+            "start": fmt_dt(r["ts"]), "dur": {"ru": "—", "az": "—"},
+            "kind": {"ru": "Соединение с провайдером переустановлено",
+                     "az": "Provayderlə əlaqə yenidən qurulub"},
+            "note": ({"ru": "Роутер в это время пропадал и из локальной сети — "
+                            "перезагрузка роутера. До этого соединение "
+                            f"держалось {fmt_dur(r['up'])}",
+                      "az": "Bu vaxt router lokal şəbəkədən də itmişdi — router "
+                            "yenidən yüklənib. Bundan əvvəl əlaqə "
+                            f"{fmt_dur(r['up'], 'az')} davam edib"}
+                     if r["reboot"] else
+                     {"ru": "Роутер по локальной сети отвечал — переподключилась "
+                            "только линия провайдера. До этого соединение "
+                            f"держалось {fmt_dur(r['up'])}",
+                      "az": "Router lokal şəbəkədə cavab verirdi — yalnız "
+                            "provayder xətti yenidən qoşulub. Bundan əvvəl əlaqə "
+                            f"{fmt_dur(r['up'], 'az')} davam edib"})})
+    for i in F["infra"]:
+        end = i["end"] or A.last
+        sec = (end - i["start"]).total_seconds()
+        events.append({
+            "t": i["start"], "a": round(pos(i["start"]), 3), "b": round(pos(end), 3),
+            "start": fmt_dt(i["start"]),
+            "dur": ({"ru": fmt_dur(sec), "az": fmt_dur(sec, "az")} if i["end"] else
+                    {"ru": "до конца периода", "az": "dövrün sonunadək"}),
+            "kind": {"ru": "Постоянное устройство пропало из сети",
+                     "az": "Daimi cihaz şəbəkədən itdi"},
+            "note": {"ru": dev_label(i["mac"], i["ip"]),
+                     "az": dev_label(i["mac"], i["ip"], "az")}})
+    for ts, left, tot, back in F["drops"]:
+        events.append({
+            "t": ts, "a": round(pos(ts), 3), "b": round(pos(ts), 3),
+            "start": fmt_dt(ts), "dur": {"ru": "—", "az": "—"},
+            "kind": {"ru": "Массовое отключение устройств",
+                     "az": "Cihazların kütləvi ayrılması"},
+            "note": {"ru": f"За один подсчёт пропало {left} из {tot} устройств, "
+                           f"{back} вернулось за {DROP_BACK_SCANS} минут — "
+                           "признак того, что точка доступа сбросила клиентов",
+                     "az": f"Bir sayım ərzində {tot} cihazdan {left} cihaz itib, "
+                           f"{DROP_BACK_SCANS} dəqiqə ərzində {back} cihaz "
+                           "qayıdıb — giriş nöqtəsinin müştəriləri atmasının "
+                           "əlaməti"}})
+    events.sort(key=lambda x: x["t"])
+    for x in events:
+        del x["t"]
     gaps = [{"a": round(pos(st), 3), "b": round(pos(en), 3)}
             for st, en, dt in A.gaps]
 
@@ -1408,11 +2402,56 @@ def render_html(A, text_report):
             "note": {"ru": "Сколько устройств ответило на ARP-запрос сервера, "
                            "включая серверы и роутеры. Ночной уровень — "
                            "постоянное оборудование; всё, что выше, — "
-                           "устройства людей.",
+                           "устройства людей."
+                           + (" Устройства за дополнительным роутером со своей "
+                              "подсетью сюда не попадают." if HIDDEN_SUBNETS else ""),
                      "az": "Serverin ARP sorğusuna cavab verən cihazların sayı "
                            "(serverlər və routerlər daxil). Gecə səviyyəsi "
                            "daimi avadanlıqdır; ondan yuxarı olan hər şey "
-                           "insanların cihazlarıdır."}})
+                           "insanların cihazlarıdır."
+                           + (" Öz alt şəbəkəsi olan əlavə routerin arxasındakı "
+                              "cihazlar bura daxil deyil." if HIDDEN_SUBNETS else "")}})
+    if T["scans"]:
+        charts.append({
+            "title": {"ru": "Смена состава устройств за минуту",
+                      "az": "Bir dəqiqədə cihaz tərkibinin dəyişməsi"},
+            "unit": "", "type": "line", "floor": 4,
+            "series": [{"key": "join", "c": 1,
+                        "name": {"ru": "Появилось", "az": "Qoşulub"}},
+                       {"key": "left", "c": 2,
+                        "name": {"ru": "Исчезло", "az": "Ayrılıb"}}],
+            "note": {"ru": "Сколько устройств в среднем появлялось и исчезало "
+                           "между соседними подсчётами. Всплеск «исчезло» при "
+                           "ровном числе людей — Wi-Fi сбрасывает клиентов.",
+                     "az": "Qonşu sayımlar arasında orta hesabla neçə cihazın "
+                           "qoşulduğu və ayrıldığı. İnsanların sayı sabit "
+                           "qalarkən «ayrılıb» sıçrayışı Wi-Fi-ın müştəriləri "
+                           "atdığını göstərir."}})
+    if T["tr_sec"]:
+        charts.append({
+            "title": {"ru": "Трафик через роутер", "az": "Routerdən keçən trafik"},
+            "unit": {"ru": "Мбит/с", "az": "Mbit/s"}, "type": "line", "floor": 4,
+            "series": [{"key": "rx", "c": 1,
+                        "name": {"ru": "К нам (загрузка)", "az": "Bizə (yükləmə)"}},
+                       {"key": "tx", "c": 2,
+                        "name": {"ru": "От нас (отдача)", "az": "Bizdən (göndərmə)"}}],
+            "note": {"ru": "По счётчикам самого роутера (UPnP). Показывает "
+                           "реальную нагрузку на канал.",
+                     "az": "Routerin öz sayğaclarına görə (UPnP). Kanalın real "
+                           "yüklənməsini göstərir."}})
+    if T["b_n"]:
+        charts.append({
+            "title": {"ru": "Серии быстрых проб", "az": "Sürətli yoxlama seriyaları"},
+            "unit": MS, "type": "line", "floor": 50,
+            "series": [{"key": "bp50", "name": usual, "c": 1},
+                       {"key": "bmax", "c": 2,
+                        "name": {"ru": "Худшая в серии", "az": "Seriyada ən pisi"}}],
+            "note": {"ru": f"{BURST_COUNT} подключений подряд за две секунды, раз "
+                           "в минуту. Высокая «худшая» при обычной средней — "
+                           "короткие замирания.",
+                     "az": f"Dəqiqədə bir dəfə, iki saniyə ərzində ardıcıl "
+                           f"{BURST_COUNT} qoşulma. Orta göstərici adi qalarkən "
+                           "yüksək «ən pis» qısa donmaları göstərir."}})
     if A.has_rdns:
         series = [{"key": "dns", "c": 1,
                    "name": {"ru": f"DNS роутера ({GATEWAY})",
@@ -1455,6 +2494,25 @@ def render_html(A, text_report):
         "note": {"ru": "Время TCP-подключения к внешним серверам через роутер.",
                  "az": "Router vasitəsilə xarici serverlərə TCP qoşulma vaxtı."}})
 
+    if T["sys_n"]:
+        charts.append({
+            "title": {"ru": "Нагрузка сервера диагностики",
+                      "az": "Diaqnostika serverinin yüklənməsi"},
+            "unit": "%", "type": "line", "floor": 100,
+            "series": [{"key": "cpu", "c": 1,
+                        "name": {"ru": "Процессор", "az": "Prosessor"}},
+                       {"key": "mem", "c": 2,
+                        "name": {"ru": "Память", "az": "Yaddaş (RAM)"}}],
+            "note": {"ru": "Загрузка процессора и занятая оперативная память "
+                           "сервера, на котором работает диагностика.",
+                     "az": "Diaqnostikanın işlədiyi serverin prosessor "
+                           "yüklənməsi və istifadə olunan operativ yaddaş."}})
+    SV = getattr(A, "server", None) or server_summary(A)
+    disk = None
+    if SV:
+        disk = {"pct": SV["pct"], "level": SV["level"], "line": SV["line"],
+                "state": SV["state"], "rec": SV["rec"], "log": SV["log"]}
+
     concl_ru = getattr(A, "conclusions", [])
     concl_az = getattr(A, "conclusions_az", concl_ru)
     data = {
@@ -1466,6 +2524,8 @@ def render_html(A, text_report):
         "points": points, "ticks": ticks, "events": events, "gaps": gaps,
         "tiles": tiles, "charts": charts,
         "conclusions": [{"ru": r, "az": z} for r, z in zip(concl_ru, concl_az)],
+        "disk": disk,
+        "sec": getattr(A, "sec_lines", []),
     }
     blob = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
     return (HTML_TEMPLATE
@@ -1555,6 +2615,17 @@ summary { cursor: pointer; color: var(--text2); }
 pre { background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
   padding: 14px; overflow-x: auto; font-size: 12px; line-height: 1.4; }
 .empty { color: var(--text2); padding: 4px 0 8px; }
+.disk-line { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px;
+  margin: 6px 0 8px; font-variant-numeric: tabular-nums; }
+.badge { font-size: 12px; padding: 1px 8px; border-radius: 10px;
+  border: 1px solid var(--border); color: var(--text2); }
+.badge::before { content: "● "; color: var(--lvl, var(--s1)); }
+.meter { height: 10px; border-radius: 5px; background: var(--grid); overflow: hidden;
+  max-width: 620px; margin-bottom: 8px; }
+.meter i { display: block; height: 100%; border-radius: 5px 0 0 5px;
+  background: var(--lvl, var(--s1)); }
+#disk-card, #sec-card { padding-bottom: 12px; }
+#sec-lines .note { margin-top: 6px; color: var(--text); font-size: 13px; }
 ol { margin: 8px 0 6px; padding-left: 22px; max-width: 860px; }
 ol li { margin-bottom: 6px; }
 </style>
@@ -1580,6 +2651,17 @@ ol li { margin-bottom: 6px; }
     <span id="stepnote"></span>
   </div>
   <div id="charts"></div>
+  <div class="card" id="disk-card">
+    <h2 id="disk-title"></h2>
+    <div class="disk-line"><span id="disk-line"></span><span class="badge" id="disk-state"></span></div>
+    <div class="meter" role="img" id="disk-meter"><i id="disk-fill"></i></div>
+    <div class="note" id="disk-rec"></div>
+    <div class="note" id="disk-log"></div>
+  </div>
+  <div class="card" id="sec-card">
+    <h2 id="sec-title"></h2>
+    <div id="sec-lines"></div>
+  </div>
   <div class="card">
     <h2 id="ev-title"></h2>
     <div class="note" id="ev-note"></div>
@@ -1629,7 +2711,8 @@ ol li { margin-bottom: 6px; }
           noEvents: 'Событий за период нет.',
           th: ['Начало', 'Длительность', 'Что произошло', 'Что наблюдалось'],
           full: 'Полный текстовый отчёт с таблицами по часам',
-          noData: 'замеров нет', n: 'замеров: ' },
+          noData: 'замеров нет', n: 'замеров: ', disk: 'Диск сервера диагностики',
+          sec: 'Безопасность сервера за период отчёта' },
     az: { title: 'NetDiag — hesabat', period: 'Dövr', obs: 'müşahidə', samples: 'ölçmə sayı',
           keyEv: 'qırmızı zolaq — aşağıdakı siyahıdan hadisə',
           keyGap: 'boz zolaq — server işləmirdi, ölçmə yoxdur',
@@ -1638,7 +2721,8 @@ ol li { margin-bottom: 6px; }
           noEvents: 'Bu dövrdə hadisə olmayıb.',
           th: ['Başlanğıc', 'Müddət', 'Nə baş verib', 'Nə müşahidə olunub'],
           full: 'Saatlar üzrə cədvəllərlə tam mətn hesabatı (rus dilində)',
-          noData: 'ölçmə yoxdur', n: 'ölçmə sayı: ' }
+          noData: 'ölçmə yoxdur', n: 'ölçmə sayı: ', disk: 'Diaqnostika serverinin diski',
+          sec: 'Hesabat dövründə serverin təhlükəsizliyi' }
   };
   var lang = 'ru';
   try { lang = localStorage.getItem('netdiag-lang') || 'ru'; } catch (e) {}
@@ -1703,6 +2787,24 @@ ol li { margin-bottom: 6px; }
       return { c: c, card: card, box: box, tip: tip };
     });
     cards.forEach(draw);
+
+    var dk = D.disk;
+    $('disk-card').style.display = dk ? '' : 'none';
+    if (dk) {
+      var lvl = dk.level === 'crit' ? 'var(--critical)' : dk.level === 'warn' ? '#fab219' : 'var(--s1)';
+      $('disk-card').style.setProperty('--lvl', lvl);
+      $('disk-title').textContent = U.disk;
+      $('disk-line').textContent = T(dk.line);
+      $('disk-state').textContent = T(dk.state);
+      $('disk-fill').style.width = Math.max(1, Math.min(100, dk.pct)) + '%';
+      $('disk-meter').setAttribute('aria-label', T(dk.line));
+      $('disk-rec').textContent = T(dk.rec);
+      $('disk-log').textContent = dk.log ? T(dk.log) : '';
+    }
+    var sl = $('sec-lines'); sl.textContent = '';
+    $('sec-card').style.display = (D.sec || []).length ? '' : 'none';
+    $('sec-title').textContent = U.sec;
+    (D.sec || []).forEach(function (x) { h('div', 'note', T(x), sl); });
   }
   [].forEach.call(document.querySelectorAll('.langs button'), function (b) {
     b.addEventListener('click', function () {
@@ -1807,8 +2909,18 @@ ol li { margin-bottom: 6px; }
 
 def build_report(since=None, until=None):
     A = Analyzer()
-    if os.path.exists(OUT_JSONL):
-        with open(OUT_JSONL, encoding="utf-8") as f:
+    for d, path in data_files():
+        try:                               # файлы целиком вне периода не читаем
+            if d is None:
+                d_last = datetime.fromtimestamp(os.path.getmtime(path), TZ).date()
+                if since and d_last < since.date():
+                    continue
+            elif (since and d < since.date()) or (until and d > until.date()):
+                continue
+            f = open(path, encoding="utf-8")
+        except OSError:
+            continue
+        with f:
             for line in f:
                 try:
                     r = json.loads(line)
@@ -1818,8 +2930,14 @@ def build_report(since=None, until=None):
                     continue
                 if (since and ts < since) or (until and ts >= until):
                     continue
-                A.feed(ts, data, r.get("ndev") if USE_DEVICE_COUNT else None)
+                A.feed(ts, data, r.get("ndev") if USE_DEVICE_COUNT else None, r)
     A.finish()
+    if A.first is not None:
+        try:
+            A.security = security_summary(A.first, A.last)
+        except Exception as e:             # журналы сервера не должны ломать отчёт
+            A.security = None
+            log.warning("security summary failed: %s", e)
     txt = render(A) if A.first is not None else "Отчёт пуст: нет данных.\n"
     with open(OUT_REPORT, "w", encoding="utf-8") as f:
         f.write(txt)
@@ -1846,8 +2964,16 @@ if __name__ == "__main__":
                 since = _parse_day(args[args.index("--since") + 1])
             if "--until" in args:
                 until = _parse_day(args[args.index("--until") + 1])
+            if "--days" in args:
+                n = int(args[args.index("--days") + 1])
+                since = (now() - timedelta(days=n)).replace(
+                    hour=0, minute=0, second=0, microsecond=0)
         except (IndexError, ValueError):
-            sys.exit("Формат: report [--since ГГГГ-ММ-ДД] [--until ГГГГ-ММ-ДД]")
+            sys.exit("Формат: report [--days N | --all] "
+                     "[--since ГГГГ-ММ-ДД] [--until ГГГГ-ММ-ДД]")
+        if since is None and until is None and "--all" not in args:
+            since = (now() - timedelta(days=REPORT_DAYS)).replace(
+                hour=0, minute=0, second=0, microsecond=0)
         sys.stdout.write(build_report(since, until))
     else:
         run()
