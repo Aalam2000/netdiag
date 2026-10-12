@@ -18,3 +18,27 @@ services:
         limits:
           cpus: '0.15'
           memory: 256M
+
+  # Отчёт: раз в час перестраивает и отдаёт по HTTP на порту 8090
+  # (для кнопки на сайте). Отдельный контейнер — построение отчёта не
+  # отнимает процессор у сборщика и не искажает замеры.
+  netdiag-report:
+    build: .
+    container_name: netdiag-report
+    restart: unless-stopped
+    network_mode: host
+    working_dir: /app
+    environment:
+      - TZ=Asia/Baku
+      - NETDIAG_HTTP_PORT=8090
+    volumes:
+      - ./netdiag.py:/app/netdiag.py:ro
+      - ./data:/data
+      - /etc/localtime:/etc/localtime:ro
+      - /var/log:/host_log:ro
+    command: python /app/netdiag.py serve
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 384M

@@ -160,6 +160,14 @@ OUT_REPORT = f"{WORK_DIR}/report.txt"
 OUT_HTML   = f"{WORK_DIR}/report.html"
 OUT_FULL   = f"{WORK_DIR}/report-full.txt"   # подробный технический
 HEARTBEAT  = f"{WORK_DIR}/heartbeat"
+
+# Отчёт по сети: отдельный контейнер netdiag-report (команда serve) раз в
+# REPORT_EVERY_MIN перестраивает отчёт за последние REPORT_DAYS суток и
+# отдаёт его по HTTP — только чтение, только файлы отчёта. Сайт ставит на
+# него ссылку или проксирует путь /netdiag/ на этот порт.
+REPORT_EVERY_MIN   = 60
+REPORT_HTTP_BIND   = os.environ.get("NETDIAG_HTTP_BIND", "0.0.0.0")
+REPORT_HTTP_PORT   = int(os.environ.get("NETDIAG_HTTP_PORT", "8090"))
 # ================
 
 os.makedirs(WORK_DIR, exist_ok=True)
@@ -2697,7 +2705,7 @@ svg.chart text { fill: var(--muted); font-size: 11px; font-variant-numeric: tabu
   border: 1px solid var(--border); border-radius: 8px; padding: 6px 9px; font-size: 12px;
   box-shadow: 0 4px 14px rgba(0,0,0,.14); white-space: nowrap; display: none; z-index: 5; }
 .tip .t { color: var(--text2); }
-.foot { color: var(--muted); font-size: 12px; }
+.foot { font-size: 12px; } .foot a { color: var(--muted); }
 </style>
 </head>
 <body>
@@ -2718,7 +2726,7 @@ svg.chart text { fill: var(--muted); font-size: 11px; font-variant-numeric: tabu
     <div class="legend"><span><i style="background:var(--s1)"></i><b data-t="cpu"></b></span>
       <span><i style="background:var(--s2)"></i><b data-t="mem"></b></span></div>
     <div class="plot"></div><div class="tip"></div></section>
-  <div class="foot" data-t="foot"></div>
+  <div class="foot"><a href="report-full.txt" target="_blank" data-t="foot"></a></div>
 </main>
 <script>
 (function () {
@@ -2727,11 +2735,11 @@ svg.chart text { fill: var(--muted); font-size: 11px; font-variant-numeric: tabu
     ru: { errLeg: "Роутер не ответил, % запросов", errLeg2: "Ошибки, % замеров",
           bad: "Замеров с ошибками", outLeg: "Интернет пропадал",
           cpu: "Процессор, %", mem: "Память, %", noData: "нет данных",
-          foot: "Подробный технический отчёт — в файле report-full.txt рядом с этим." },
+          foot: "Подробный технический отчёт" },
     az: { errLeg: "Router cavab vermədi, sorğuların %-i", errLeg2: "Səhvlər, ölçmələrin %-i",
           bad: "Səhvli ölçmələr", outLeg: "İnternet itib",
           cpu: "Prosessor, %", mem: "Yaddaş, %", noData: "məlumat yoxdur",
-          foot: "Ətraflı texniki hesabat — yanındakı report-full.txt faylında." }
+          foot: "Ətraflı texniki hesabat" }
   };
   var lang = "ru";
   try { lang = localStorage.getItem("netdiag-lang") || "ru"; } catch (e) {}
@@ -2890,6 +2898,14 @@ def constant_devices(since, until):
     return {m for m, n in seen.items() if n >= INFRA_SHARE * scans}
 
 
+def _write(path, text):
+    """Запись целиком: веб-сервер никогда не отдаст наполовину записанный файл."""
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
 def build_report(since=None, until=None):
     A = Analyzer()
     const = constant_devices(since, until) if USE_DEVICE_COUNT else None
@@ -2934,23 +2950,91 @@ def build_report(since=None, until=None):
             log.warning("security summary failed: %s", e)
     if A.first is None:
         txt = "Отчёт пуст: нет данных.\n"
-        with open(OUT_REPORT, "w", encoding="utf-8") as f:
-            f.write(txt)
+        _write(OUT_REPORT, txt)
         return txt
-    full = render(A)                       # подробный: для разбора, не для руководства
-    with open(OUT_FULL, "w", encoding="utf-8") as f:
-        f.write(full)
+    _write(OUT_FULL, render(A))            # подробный: для разбора, не для руководства
     B = brief(A)
     txt = render_brief(A, B)
-    with open(OUT_REPORT, "w", encoding="utf-8") as f:
-        f.write(txt)
+    _write(OUT_REPORT, txt)
     try:
-        with open(OUT_HTML, "w", encoding="utf-8") as f:
-            f.write(render_html(A, B))
+        _write(OUT_HTML, render_html(A, B))
     except Exception as e:                     # графики не должны ломать отчёт
         log.warning("html report failed: %s", e)
     log.info("report written: %s", OUT_REPORT)
     return txt
+
+
+# ---- отдача отчёта по HTTP ----
+
+SERVE_FILES = {"/": (OUT_HTML, "text/html; charset=utf-8"),
+               "/report.html": (OUT_HTML, "text/html; charset=utf-8"),
+               "/report-full.txt": (OUT_FULL, "text/plain; charset=utf-8"),
+               "/report.txt": (OUT_REPORT, "text/plain; charset=utf-8")}
+
+WAIT_PAGE = ("<!doctype html><meta charset=utf-8><title>NetDiag</title>"
+             "<p style='font:16px system-ui;margin:40px'>Отчёт строится, "
+             "обновите страницу через пару минут.</p>").encode()
+
+
+def report_server():
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class H(BaseHTTPRequestHandler):
+        def _send(self, body):
+            path = self.path.split("?", 1)[0]
+            item = SERVE_FILES.get(path)
+            if item is None:
+                self.send_error(404)
+                return
+            fn, ctype = item
+            try:
+                with open(fn, "rb") as f:
+                    data = f.read()
+            except OSError:
+                data, ctype = WAIT_PAGE, "text/html; charset=utf-8"
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Robots-Tag", "noindex")
+            self.end_headers()
+            if body:
+                self.wfile.write(data)
+
+        def do_GET(self):
+            self._send(True)
+
+        def do_HEAD(self):
+            self._send(False)
+
+        def log_message(self, *a):         # без записи каждого запроса
+            pass
+
+    srv = ThreadingHTTPServer((REPORT_HTTP_BIND, REPORT_HTTP_PORT), H)
+    srv.daemon_threads = True
+    log.info("report http: %s:%s", REPORT_HTTP_BIND, REPORT_HTTP_PORT)
+    srv.serve_forever()
+
+
+def serve():
+    """Контейнер netdiag-report: отдаёт отчёт и перестраивает его по расписанию."""
+    signal.signal(signal.SIGTERM, _on_term)
+    signal.signal(signal.SIGINT, _on_term)
+    try:
+        os.nice(10)                        # уступаем процессор всему остальному
+    except OSError:
+        pass
+    threading.Thread(target=report_server, daemon=True).start()
+    while not _stop:
+        t0 = time.time()
+        try:
+            build_report((now() - timedelta(days=REPORT_DAYS)).replace(
+                hour=0, minute=0, second=0, microsecond=0))
+            log.info("scheduled report built in %.0f s", time.time() - t0)
+        except Exception as e:
+            log.warning("scheduled report failed: %s", e)
+        while not _stop and time.time() - t0 < REPORT_EVERY_MIN * 60:
+            time.sleep(1)
 
 
 def _parse_day(s):
@@ -2977,5 +3061,7 @@ if __name__ == "__main__":
             since = (now() - timedelta(days=REPORT_DAYS)).replace(
                 hour=0, minute=0, second=0, microsecond=0)
         sys.stdout.write(build_report(since, until))
+    elif len(sys.argv) > 1 and sys.argv[1] == "serve":
+        serve()
     else:
         run()

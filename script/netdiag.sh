@@ -128,19 +128,22 @@ main() {
         echo "[*] Пересобираю и перезапускаю..."
         docker compose up -d --build --force-recreate
         sleep 8
-        STATE="$(docker inspect -f '{{.State.Status}} {{.RestartCount}}' netdiag 2>/dev/null || true)"
-        if [ "$STATE" != "running 0" ]; then
-            echo "[!] Контейнер не работает стабильно (состояние: ${STATE:-нет контейнера}). Последние строки:"
-            docker compose logs --tail 20 || true
-            [ -n "$OLD" ] && echo "[!] Вернуть прежнюю версию: git reset --hard $OLD && netdiag start"
-            exit 1
-        fi
+        for C in netdiag netdiag-report; do
+            STATE="$(docker inspect -f '{{.State.Status}} {{.RestartCount}}' $C 2>/dev/null || true)"
+            if [ "$STATE" != "running 0" ]; then
+                echo "[!] Контейнер $C не работает стабильно (состояние: ${STATE:-нет контейнера}). Последние строки:"
+                docker compose logs --tail 20 $C || true
+                [ -n "$OLD" ] && echo "[!] Вернуть прежнюю версию: git reset --hard $OLD && netdiag start"
+                exit 1
+            fi
+        done
         echo "$NEW" > .git/netdiag-deployed
         docker compose ps
         echo
         tail -n 6 data/netdiag.log 2>/dev/null || true
         echo
         echo "[*] Установлена версия: $(version)"
+        echo "[*] Отчёт: http://$(hostname -I | awk '{print $1}'):8090/ (обновляется раз в час)"
         [ -n "$OLD" ] && [ "$OLD" != "$NEW" ] && echo "[*] Была: $OLD"
         echo "[*] Данные в ./data сохранены."
         ;;
@@ -155,7 +158,7 @@ main() {
 
       stop)
         echo "[*] Строю отчёт и останавливаю..."
-        docker compose exec -T netdiag python /app/netdiag.py report > /dev/null || true
+        docker compose exec -T netdiag-report python /app/netdiag.py report > /dev/null || true
         docker compose stop
         echo "[*] Отчёт готов: ./data/report.html, подробно — ./data/report-full.txt"
         ;;
@@ -167,6 +170,7 @@ main() {
 
       status)
         echo "Версия: $(version)"
+        echo "Отчёт: http://$(hostname -I | awk '{print $1}'):8090/"
         docker compose ps
         echo
         tail -n 10 data/netdiag.log 2>/dev/null || true
@@ -183,7 +187,7 @@ main() {
       report)
         echo "[*] Строю отчёт по накопленным данным..."
         shift
-        docker compose exec -T netdiag python /app/netdiag.py report "$@"
+        docker compose exec -T netdiag-report python /app/netdiag.py report "$@"
         echo "[*] Для руководства: $PROJECT_DIR/data/report.html (открыть в браузере)"
         echo "[*] Подробно: $PROJECT_DIR/data/report-full.txt"
         ;;
