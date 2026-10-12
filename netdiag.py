@@ -131,6 +131,18 @@ DEVICE_SCAN_SEC    = 60  # как часто считать устройства
 DEVICE_ROUNDS      = 3   # сколько раз повторять рассылку за один подсчёт
 DEVICE_BUCKETS     = [(0, 30), (31, 45), (46, 60), (61, 80), (81, None)]
 
+# Сторож петель и широковещательных штормов. Ничего не отправляет в сеть:
+# слушает широковещательные и групповые пакеты, которые и так приходят на
+# сервер, и раз в BCAST_SEC записывает, сколько их было и кто слал больше всех.
+BCAST_WATCH        = True
+BCAST_SEC          = 60
+BCAST_READ_MAX     = 5000    # больше за минуту не разбираем (при шторме
+                             # остальное досчитывает ядро) — бережём процессор
+STORM_PPS          = 200     # пакетов в секунду в среднем за минуту — всплеск
+                             # (обычно в сети академии около 6)
+ARP_DUP_MIN        = 4       # столько и больше ответов на один ARP-запрос —
+                             # аномалия (признак петли)
+
 WORK_HOURS = (9, 21)     # используется, только если нет данных о числе устройств
 MAX_EVENTS_LISTED = 150
 
@@ -582,13 +594,14 @@ def _lan_iface():
 
 def arp_scan(iface, my_ip, my_mac, rounds=DEVICE_ROUNDS):
     """Рассылает ARP-запросы на все адреса LAN_NET и возвращает {ip: mac}
-    ответивших. Запросы повторяются: устройства на Wi-Fi отвечают не сразу."""
+    ответивших и {ip: сколько ответов пришло нам}. Запросы повторяются:
+    устройства на Wi-Fi отвечают не сразу."""
     net = ipaddress.ip_network(LAN_NET)
     hosts = [h for h in net.hosts() if str(h) != my_ip]
     spa = socket.inet_aton(my_ip)
     head = (b"\xff" * 6 + my_mac + b"\x08\x06"
             + struct.pack(">HHBBH", 1, 0x0800, 6, 4, 1) + my_mac + spa + b"\x00" * 6)
-    found = {}
+    found, replies = {}, Counter()
     s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0806))
     try:
         s.bind((iface, 0))
@@ -611,6 +624,8 @@ def arp_scan(iface, my_ip, my_mac, rounds=DEVICE_ROUNDS):
                 ip = socket.inet_ntoa(pkt[28:32])
                 if ip != my_ip and ipaddress.ip_address(ip) in net:
                     found[ip] = pkt[22:28]
+                    if pkt[38:42] == spa:          # ответ именно нам
+                        replies[ip] += 1
 
         for _ in range(rounds):
             for h in hosts:
@@ -624,7 +639,7 @@ def arp_scan(iface, my_ip, my_mac, rounds=DEVICE_ROUNDS):
             listen(1.5)
     finally:
         s.close()
-    return found
+    return found, replies
 
 
 def device_scanner():
@@ -651,10 +666,15 @@ def device_scanner():
     while not _stop:
         t0 = time.time()
         try:
-            found = arp_scan(iface, my_ip, my_mac)
+            found, replies = arp_scan(iface, my_ip, my_mac)
             _dev["n"] = len(found)
             _dev["t"] = time.time()
             put_extra("devs", {ip: mac.hex() for ip, mac in found.items()})
+            dups = {ip: [found[ip].hex(), n] for ip, n in replies.items()
+                    if n >= ARP_DUP_MIN and ip in found}
+            if dups:
+                put_extra("arpdup", dups)
+                log.warning("arp: многократные ответы %s", dups)
             failures = 0
         except PermissionError:
             log.warning("device scan disabled: нет прав на ARP "
@@ -666,6 +686,98 @@ def device_scanner():
                 log.warning("device scan failed: %s", e)
         while not _stop and time.time() - t0 < DEVICE_SCAN_SEC:
             time.sleep(1)
+
+
+def _pkt_stats(s):
+    """Сколько пакетов прошло фильтр сокета с прошлого вызова (вместе с теми,
+    что ядро отбросило из-за переполнения очереди). Счётчик сбрасывается."""
+    packets, _drops = struct.unpack("II", s.getsockopt(263, 6, 8))  # SOL_PACKET, PACKET_STATISTICS
+    return packets
+
+
+def bcast_socket(iface):
+    """Сокет, получающий только широковещательные и групповые кадры: фильтр
+    в ядре отсекает всё остальное, поэтому обычный трафик сервера не мешает."""
+    import ctypes
+    s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003))
+    try:
+        prog = [(0x20, 0, 0, 0xfffff004),   # A = тип кадра (pkt_type)
+                (0x15, 2, 0, 1),            # broadcast → принять
+                (0x15, 1, 0, 2),            # multicast → принять
+                (0x06, 0, 0, 0),            # остальное — отбросить
+                (0x06, 0, 0, 64)]           # принять первые 64 байта
+        buf = ctypes.create_string_buffer(
+            b"".join(struct.pack("HBBI", *i) for i in prog))
+        s.setsockopt(socket.SOL_SOCKET, 26,                  # SO_ATTACH_FILTER
+                     struct.pack("HL", len(prog), ctypes.addressof(buf)))
+        # ядро копирует фильтр при подключении — buf дальше не нужен
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 18)
+        s.bind((iface, 0))
+        while True:                         # выбрасываем пришедшее до фильтра
+            s.setblocking(False)
+            try:
+                s.recv(64)
+            except (BlockingIOError, OSError):
+                break
+        s.setblocking(True)
+        _pkt_stats(s)
+        return s
+    except Exception:
+        s.close()
+        raise
+
+
+def bcast_watcher():
+    """Раз в BCAST_SEC: сколько широковещательных и групповых пакетов пришло
+    и кто слал больше всех. Петля или шторм видны как резкий рост."""
+    try:
+        me = _lan_iface()
+        if me is None:
+            log.warning("bcast watch disabled: у сервера нет адреса в %s", LAN_NET)
+            return
+        s = bcast_socket(me[0])
+    except Exception as e:
+        log.warning("bcast watch disabled: %s", e)
+        return
+    log.info("bcast watch: %s", me[0])
+    try:
+        while not _stop:
+            t0, seen, read = time.monotonic(), Counter(), 0
+            while not _stop:
+                left = BCAST_SEC - (time.monotonic() - t0)
+                if left <= 0:
+                    break
+                if read >= BCAST_READ_MAX:      # шторм: дальше считает ядро
+                    time.sleep(min(left, 1.0))
+                    continue
+                s.settimeout(min(left, 1.0))
+                try:
+                    pkt = s.recv(64)
+                except socket.timeout:
+                    continue
+                if len(pkt) >= 12:
+                    read += 1
+                    seen[pkt[6:12]] += 1
+            if _stop:
+                break
+            if read >= BCAST_READ_MAX:          # выбрасываем накопившееся, чтобы
+                s.setblocking(False)            # оно не попало в следующую минуту
+                try:
+                    for _ in range(100000):
+                        s.recv(64)
+                except (BlockingIOError, OSError):
+                    pass
+                s.setblocking(True)
+            try:
+                n = _pkt_stats(s)
+            except OSError:
+                n = read
+            put_extra("bc", {"n": n, "sec": round(time.monotonic() - t0, 1),
+                             "top": [[m.hex(), c] for m, c in seen.most_common(3)]})
+    except Exception as e:
+        log.warning("bcast watch stopped: %s", e)
+    finally:
+        s.close()
 
 
 def current_devices():
@@ -943,6 +1055,8 @@ def run():
         threading.Thread(target=burst_prober, daemon=True).start()
     if SYS_STATS:
         threading.Thread(target=sys_sampler, daemon=True).start()
+    if BCAST_WATCH:
+        threading.Thread(target=bcast_watcher, daemon=True).start()
     f, cur_day = None, None
     try:
         while not _stop:
@@ -1066,6 +1180,7 @@ def _stat():
             "b_p50": array("f"), "b_max": array("f"),
             "cpu_sum": 0.0, "mem_sum": 0.0, "sys_n": 0,      # сервер
             "cpu_max": 0.0, "mem_max": 0.0,
+            "bc_n": 0, "bc_sec": 0.0, "bc_max": 0.0,         # широковещательные
             "dev_sum": 0, "dev_n": 0, "dev_max": 0, "outages": 0}
 
 
@@ -1109,6 +1224,11 @@ class Analyzer:
         self.drops = []                    # (когда, пропало, из скольких, вернулось)
         self.dv_pending = []               # отключения, ждущие проверки на возврат
         self.sys_first = self.sys_last = None    # (когда, запись) о сервере
+        self.n_const = None                # постоянных устройств (вычтены из числа)
+        self.bc_pps = array("f")           # широковещательных пакетов/с по минутам
+        self.storms = []                   # всплески широковещательного трафика
+        self.arpdups = []                  # (когда, ip, mac, сколько ответов)
+        self.mac_ip = {}                   # mac → последний известный ip
 
     @property
     def has_rdns(self):
@@ -1151,6 +1271,11 @@ class Analyzer:
                 s["sys_n"] += 1
                 s["cpu_max"] = max(s["cpu_max"], y["cpu"])
                 s["mem_max"] = max(s["mem_max"], y.get("mem", 0.0))
+        bc = rec.get("bc")
+        if bc and bc.get("sec"):
+            self._bcast(ts, bc, spots)
+        for ip, (mac, n) in (rec.get("arpdup") or {}).items():
+            self.arpdups.append((ts, ip, mac, n))
         b = rec.get("burst")
         if b:
             for s in spots:
@@ -1165,6 +1290,26 @@ class Analyzer:
         devs = rec.get("devs")
         if devs and USE_DEVICE_COUNT:
             self._devs(ts, devs, spots)
+
+    def _bcast(self, ts, bc, spots):
+        sec = bc["sec"]
+        pps = bc.get("n", 0) / sec
+        self.bc_pps.append(pps)
+        for s in spots:
+            s["bc_n"] += bc.get("n", 0)
+            s["bc_sec"] += sec
+            s["bc_max"] = max(s["bc_max"], pps)
+        if pps < STORM_PPS:
+            return
+        start = ts - timedelta(seconds=sec)
+        top = bc.get("top") or []
+        st = self.storms[-1] if self.storms else None
+        if st and (start - st["end"]).total_seconds() <= 2 * BCAST_SEC:
+            st["end"] = ts
+            if pps > st["pps"]:
+                st["pps"], st["top"] = pps, top
+        else:
+            self.storms.append({"start": start, "end": ts, "pps": pps, "top": top})
 
     def _upnp(self, ts, u, spots):
         self.upnp_n += 1
@@ -1482,6 +1627,12 @@ def dev_label(mac, ip, lang="ru"):
     return f"{ip} ({mac_fmt(mac)}{tag})"
 
 
+def mac_label(A, mac, lang="ru"):
+    """Подпись устройства по MAC: с адресом, если он встречался в подсчётах."""
+    ip = getattr(A, "mac_ip", {}).get(mac)
+    return dev_label(mac, ip, lang) if ip else mac_fmt(mac)
+
+
 def fmt_bytes(n, lang="ru"):
     units = {"ru": ("МБ", "ГБ"), "az": ("MB", "GB")}[lang]
     if n >= 1024 ** 3:
@@ -1614,11 +1765,18 @@ def render(A):
     L.append("    - TCP-подключение к 6 внешним ресурсам (8.8.8.8, 1.1.1.1, 9.9.9.9,")
     L.append("      google.com, cloudflare.com, github.com) — идёт ли трафик наружу.")
     if with_dev:
-        L.append(f"  Раз в {DEVICE_SCAN_SEC} сек считалось число устройств в сети {LAN_NET}")
-        L.append("  (по ответам на ARP-запросы сервера; в число входят серверы и роутеры).")
+        L += wrap(f"Раз в {DEVICE_SCAN_SEC} сек сервер опрашивал по ARP сеть "
+                  f"{LAN_NET}. Постоянных устройств (серверы, виртуальные машины, "
+                  f"роутеры, камеры — отвечают почти всегда): {A.n_const}; они из "
+                  "подсчёта исключены. «Устр. людей» в таблицах — устройства "
+                  "людей, видимые в этой сети.", 76, "  ", "  ")
         if HIDDEN_SUBNETS:
-            L.append(f"  Устройства за дополнительным роутером ({', '.join(HIDDEN_SUBNETS)})")
-            L.append("  серверу не видны: реальное число устройств больше.")
+            L += wrap(f"ВАЖНО: большинство устройств людей подключено через "
+                      f"вложенные роутеры (подсеть {', '.join(HIDDEN_SUBNETS)}) и "
+                      "серверу не видно — каждый такой роутер виден как одно "
+                      "устройство. Видимое число — малая часть: за период в "
+                      f"основной сети было не больше {T['dev_max']} устройств "
+                      "людей одновременно.", 76, "  ", "  ")
     else:
         L.append("  Числа устройств в этих данных нет — нагрузка оценивается по")
         L.append("  времени суток.")
@@ -1683,7 +1841,7 @@ def render(A):
     if with_ctl:
         head.append("контр.,%")
     if with_dev:
-        head.append("устройств")
+        head.append("устр. людей")
     head.append("обрывов")
     legend = [
         "  отклон. — доля замеров с любым отклонением; обрыв — доля времени без",
@@ -1691,7 +1849,8 @@ def render(A):
         "  и граница 5% худших замеров; наружу — то же до внешних ресурсов;",
         "  медл. — доля медленных замеров; DNS пот. — доля DNS-запросов к",
         "  роутеру, оставшихся без ответа; контр. — то же для запросов напрямую",
-        "  к 8.8.8.8; обрывов — число полных обрывов.",
+        "  к 8.8.8.8; устр. людей — в среднем видимых устройств людей в",
+        "  основной сети (без постоянных); обрывов — число полных обрывов.",
     ]
 
     # ---------- дополнительные проверки ----------
@@ -1731,6 +1890,35 @@ def render(A):
         for ts, left, tot, back in F["drops"][:MAX_EVENTS_LISTED]:
             X.append(f"      {fmt_dt(ts)}: пропало {left} из {tot}, "
                      f"вернулось {back} за {DROP_BACK_SCANS} мин")
+    if A.bc_pps:
+        for st in A.storms:
+            a = st["start"] - timedelta(seconds=60)
+            b = st["end"] + timedelta(seconds=60)
+            st["hit"] = any(e["start"] <= b and e["end"] >= a for e in A.events
+                            if e["kind"] in ("outage", "blip", "dns", "partial",
+                                             "gwmute"))
+        n_hit = sum(1 for st in A.storms if st["hit"])
+        X += wrap(f"Широковещательные и групповые пакеты в основной сети "
+                  f"(сервер только слушает): обычно {quantile(A.bc_pps, 0.5):.0f} "
+                  f"в секунду, максимум {max(A.bc_pps):.0f} в секунду (в среднем "
+                  f"за минуту). Всплесков от {STORM_PPS} в секунду — признак петли "
+                  f"или шторма: {len(A.storms)}"
+                  + (f", из них совпали со сбоями: {n_hit}." if A.storms else "."),
+                  76, "  ", "    ")
+        for st in A.storms[:MAX_EVENTS_LISTED]:
+            who = (f"; больше всех слал {mac_label(A, st['top'][0][0])}"
+                   if st["top"] else "")
+            X += wrap(f"с {fmt_dt(st['start'])} по {fmt_dt(st['end'])}: до "
+                      f"{st['pps']:.0f} пакетов в секунду{who}; "
+                      + ("в это время был сбой." if st["hit"] else
+                         "сбоев в это время не было."), 76, "      ", "        ")
+    if A.dv_scans:
+        X += wrap(f"Многократные ответы на один ARP-запрос (от {ARP_DUP_MIN}; "
+                  f"признак петли): {len(A.arpdups)}.", 76, "  ", "    ")
+        for ts, ip, mac, n in A.arpdups[:MAX_EVENTS_LISTED]:
+            X += wrap(f"{fmt_dt(ts)}: {dev_label(mac, ip)} — "
+                      f"{plural(n, 'ответ', 'ответа', 'ответов')}",
+                      76, "      ", "        ")
     SV = A.server = server_summary(A)
     if T["sys_n"]:
         L.append("СЕРВЕР ДИАГНОСТИКИ")
@@ -1756,22 +1944,14 @@ def render(A):
         L += X
         L.append("")
 
-    # ---------- по числу устройств ----------
-    if with_dev:
-        L.append("ЗАВИСИМОСТЬ ОТ ЧИСЛА УСТРОЙСТВ В СЕТИ")
-        rows = [stat_row(bucket_label(i), A.bucket[i], True, thr, with_dns, with_ctl)
-                for i in range(len(DEVICE_BUCKETS)) if A.bucket[i]["n"]]
-        L += table(["устройств"] + head[1:], rows)
-        L += legend
-        L.append("")
-
+    # Таблицы по числу устройств нет: большая часть устройств не видна
+    # (за вложенными роутерами), и неполное число не годится как мера нагрузки.
     # ---------- по часам ----------
     L.append("ПО ЧАСАМ СУТОК")
     rows = [stat_row(f"{h:02d}:00", A.hour[h], with_dev, thr, with_dns, with_ctl)
             for h in range(24) if A.hour[h]["n"]]
     L += table(["час"] + head[1:], rows)
-    if not with_dev:
-        L += legend
+    L += legend
     L.append("")
 
     L.append("ПО ДНЯМ НЕДЕЛИ")
@@ -1793,13 +1973,14 @@ def render(A):
             rows.append(r)
         h2 = ["дата", "отклон.,%", "обрывов", "без интернета"]
         if with_dev:
-            h2.append("макс. устройств")
+            h2.append("макс. устр. людей")
         L += table(h2, rows)
         L.append("")
 
     # ---------- список событий ----------
     def dev_txt(e):
-        return f", устройств в сети: {e['dev']}" if e["dev"] is not None and with_dev else ""
+        return (f", устройств людей в основной сети: {e['dev']}"
+                if e["dev"] is not None and with_dev else "")
 
     if outages:
         L.append("ПОЛНЫЕ ОБРЫВЫ ИНТЕРНЕТА")
@@ -1946,11 +2127,22 @@ def render(A):
             "fasilələrlə cavab verməsi ilə müşayiət olunub. Bu, routerin "
             "həddən artıq yüklənməsinin əlamətidir, lakin qəti sübut deyil.")
 
+    if A.storms:
+        n_hit = sum(1 for st in A.storms if st["hit"])
+        say(f"Всплесков широковещательного трафика (петля или шторм в локальной "
+            f"сети): {len(A.storms)}, из них совпали со сбоями: {n_hit}. Это "
+            "происходит внутри сети академии, провайдер к этому отношения не имеет."
+            + (" Сбои во время всплесков объясняются ими." if n_hit else ""),
+            f"Yayım trafikinin sıçrayışları (lokal şəbəkədə ilgək və ya fırtına): "
+            f"{len(A.storms)}, onlardan nasazlıqlarla üst-üstə düşən: {n_hit}. Bu, "
+            "akademiyanın şəbəkəsinin daxilində baş verir, provayderin buna "
+            "aidiyyəti yoxdur."
+            + (" Sıçrayışlar zamanı nasazlıqlar onlarla izah olunur." if n_hit else ""))
+
     # зависимость от нагрузки
     MIN_N = 720                      # не меньше часа наблюдений в группе
     lo = hi = None
-    filled = ([i for i in range(len(DEVICE_BUCKETS)) if A.bucket[i]["n"] >= MIN_N]
-              if with_dev else [])
+    filled = []                      # число устройств неполное — сравниваем по часам
     if len(filled) >= 2:
         lo, hi = A.bucket[filled[0]], A.bucket[filled[-1]]
         lo_name = f"при {bucket_label(filled[0])} устройствах"
@@ -2161,8 +2353,10 @@ def _merge(stats):
         for k in ("n", "bad", "sec", "black_sec", "dns_try", "dns_lost",
                   "ctl_try", "ctl_lost", "dev_sum", "dev_n",
                   "join", "left", "scans", "rx_bits", "tx_bits", "tr_sec",
-                  "b_n", "b_lost", "cpu_sum", "mem_sum", "sys_n"):
+                  "b_n", "b_lost", "cpu_sum", "mem_sum", "sys_n",
+                  "bc_n", "bc_sec"):
             m[k] += s[k]
+        m["bc_max"] = max(m["bc_max"], s["bc_max"])
         for k in ("rtt", "ext", "b_p50", "b_max"):
             m[k].extend(s[k])
     return m
@@ -2211,6 +2405,8 @@ def build_timeline(A):
             "bmax": _r(max(m["b_max"]), 1) if m["b_max"] else None,
             "cpu": _r(m["cpu_sum"] / m["sys_n"], 1) if m["sys_n"] else None,
             "mem": _r(m["mem_sum"] / m["sys_n"], 1) if m["sys_n"] else None,
+            "bc": _r(m["bc_n"] / m["bc_sec"], 1) if m["bc_sec"] else None,
+            "bcmax": _r(m["bc_max"], 1) if m["bc_sec"] else None,
         })
 
     start_sec = b0 * per * TL_STEP_SEC
@@ -2353,6 +2549,35 @@ def render_html(A, text_report):
                            f"{DROP_BACK_SCANS} dəqiqə ərzində {back} cihaz "
                            "qayıdıb — giriş nöqtəsinin müştəriləri atmasının "
                            "əlaməti"}})
+    for st in A.storms:
+        top = st["top"][0][0] if st["top"] else None
+        who = mac_label(A, top) if top else None
+        sec = (st["end"] - st["start"]).total_seconds()
+        events.append({
+            "t": st["start"], "a": round(pos(st["start"]), 3),
+            "b": round(pos(st["end"]), 3), "start": fmt_dt(st["start"]),
+            "dur": {"ru": fmt_dur(sec), "az": fmt_dur(sec, "az")},
+            "kind": {"ru": "Всплеск широковещательного трафика",
+                     "az": "Yayım trafikinin sıçrayışı"},
+            "note": {"ru": f"До {st['pps']:.0f} пакетов в секунду — петля или "
+                           "шторм в локальной сети"
+                           + (f"; больше всех слал {who}" if who else "")
+                           + ("; в это время был сбой" if st.get("hit") else ""),
+                     "az": f"Saniyədə {st['pps']:.0f} paketədək — lokal şəbəkədə "
+                           "ilgək və ya fırtına"
+                           + (f"; ən çox göndərən: {who}" if who else "")
+                           + ("; bu vaxt nasazlıq olub" if st.get("hit") else "")}})
+    for ts, ip, mac, n in A.arpdups:
+        events.append({
+            "t": ts, "a": round(pos(ts), 3), "b": round(pos(ts), 3),
+            "start": fmt_dt(ts), "dur": {"ru": "—", "az": "—"},
+            "kind": {"ru": "Многократный ответ на ARP-запрос",
+                     "az": "ARP sorğusuna çoxsaylı cavab"},
+            "note": {"ru": f"{dev_label(mac, ip)}: "
+                           f"{plural(n, 'ответ', 'ответа', 'ответов')} на один запрос — "
+                           "признак петли в сети",
+                     "az": f"{dev_label(mac, ip, 'az')}: bir sorğuya {n} cavab — "
+                           "şəbəkədə ilgək əlaməti"}})
     events.sort(key=lambda x: x["t"])
     for x in events:
         del x["t"]
@@ -2395,22 +2620,27 @@ def render_html(A, text_report):
     worst = {"ru": "5% худших замеров", "az": "Ən pis 5% ölçmə"}
     charts = []
     if T["dev_n"]:
-        dev_name = {"ru": "Устройств в сети", "az": "Şəbəkədəki cihazlar"}
+        dev_name = {"ru": "Устройства людей в основной сети (видимая часть)",
+                    "az": "Əsas şəbəkədə insanların cihazları (görünən hissə)"}
         charts.append({
-            "title": dev_name, "unit": "", "type": "line", "floor": 20,
+            "title": dev_name, "unit": "", "type": "line", "floor": 5,
             "series": [{"key": "dev", "name": dev_name, "c": 1}],
-            "note": {"ru": "Сколько устройств ответило на ARP-запрос сервера, "
-                           "включая серверы и роутеры. Ночной уровень — "
-                           "постоянное оборудование; всё, что выше, — "
-                           "устройства людей."
-                           + (" Устройства за дополнительным роутером со своей "
-                              "подсетью сюда не попадают." if HIDDEN_SUBNETS else ""),
-                     "az": "Serverin ARP sorğusuna cavab verən cihazların sayı "
-                           "(serverlər və routerlər daxil). Gecə səviyyəsi "
-                           "daimi avadanlıqdır; ondan yuxarı olan hər şey "
-                           "insanların cihazlarıdır."
-                           + (" Öz alt şəbəkəsi olan əlavə routerin arxasındakı "
-                              "cihazlar bura daxil deyil." if HIDDEN_SUBNETS else "")}})
+            "note": {"ru": f"Устройства, ответившие на ARP-запрос сервера, без "
+                           f"{A.n_const} постоянных (серверы, виртуальные машины, "
+                           "роутеры, камеры)."
+                           + (" Большинство устройств людей подключено через "
+                              "вложенные роутеры (подсеть "
+                              f"{', '.join(HIDDEN_SUBNETS)}) и здесь не видно — "
+                              "реальное число в несколько раз больше."
+                              if HIDDEN_SUBNETS else ""),
+                     "az": f"Serverin ARP sorğusuna cavab verən cihazlar, "
+                           f"{A.n_const} daimi cihaz (serverlər, virtual maşınlar, "
+                           "routerlər, kameralar) çıxılmaqla."
+                           + (" İnsanların cihazlarının əksəriyyəti daxili "
+                              "routerlər vasitəsilə qoşulub (alt şəbəkə "
+                              f"{', '.join(HIDDEN_SUBNETS)}) və burada görünmür — "
+                              "real say bir neçə dəfə çoxdur."
+                              if HIDDEN_SUBNETS else "")}})
     if T["scans"]:
         charts.append({
             "title": {"ru": "Смена состава устройств за минуту",
@@ -2427,6 +2657,23 @@ def render_html(A, text_report):
                            "qoşulduğu və ayrıldığı. İnsanların sayı sabit "
                            "qalarkən «ayrılıb» sıçrayışı Wi-Fi-ın müştəriləri "
                            "atdığını göstərir."}})
+    if T["bc_sec"]:
+        charts.append({
+            "title": {"ru": "Широковещательный трафик в сети",
+                      "az": "Şəbəkədə yayım trafiki"},
+            "unit": {"ru": "пак/с", "az": "paket/s"}, "type": "line", "floor": 20,
+            "series": [{"key": "bc", "c": 1,
+                        "name": {"ru": "В среднем", "az": "Orta hesabla"}},
+                       {"key": "bcmax", "c": 2,
+                        "name": {"ru": "Худшая минута", "az": "Ən pis dəqiqə"}}],
+            "note": {"ru": "Широковещательные и групповые пакеты, приходящие на "
+                           "сервер; сервер ничего не отправляет. Обычно их "
+                           f"единицы в секунду. Скачок до сотен и тысяч (от "
+                           f"{STORM_PPS}) — петля или шторм в локальной сети.",
+                     "az": "Serverə gələn yayım və qrup paketləri; server heç nə "
+                           "göndərmir. Adətən saniyədə bir neçə olur. Yüzlərlə "
+                           f"və minlərlə sıçrayış ({STORM_PPS}-dən) lokal "
+                           "şəbəkədə ilgək və ya fırtınadır."}})
     if T["tr_sec"]:
         charts.append({
             "title": {"ru": "Трафик через роутер", "az": "Routerdən keçən trafik"},
@@ -2907,8 +3154,54 @@ ol li { margin-bottom: 6px; }
 """
 
 
+def _report_files(since, until):
+    """Файлы лога, которые могут пересекаться с периодом отчёта."""
+    for d, path in data_files():
+        try:                               # файлы целиком вне периода не читаем
+            if d is None:
+                d_last = datetime.fromtimestamp(os.path.getmtime(path), TZ).date()
+                if since and d_last < since.date():
+                    continue
+            elif (since and d < since.date()) or (until and d > until.date()):
+                continue
+        except OSError:
+            continue
+        yield path
+
+
+def constant_devices(since, until):
+    """MAC-адреса, отвечавшие не реже чем в INFRA_SHARE подсчётов за период:
+    серверы, виртуальные машины, роутеры, камеры. None — подсчётов мало."""
+    seen, scans = Counter(), 0
+    for path in _report_files(since, until):
+        try:
+            f = open(path, encoding="utf-8")
+        except OSError:
+            continue
+        with f:
+            for line in f:
+                if '"devs"' not in line:
+                    continue
+                try:
+                    r = json.loads(line)
+                    ts = to_aware(r["ts"])
+                    devs = r["devs"]
+                except Exception:
+                    continue
+                if (since and ts < since) or (until and ts >= until):
+                    continue
+                scans += 1
+                seen.update(set(devs.values()))
+    if scans < INFRA_MIN_SCANS:
+        return None
+    return {m for m, n in seen.items() if n >= INFRA_SHARE * scans}
+
+
 def build_report(since=None, until=None):
     A = Analyzer()
+    const = constant_devices(since, until) if USE_DEVICE_COUNT else None
+    A.n_const = len(const) if const is not None else None
+    people = None                          # видимых устройств людей
     for d, path in data_files():
         try:                               # файлы целиком вне периода не читаем
             if d is None:
@@ -2930,7 +3223,15 @@ def build_report(since=None, until=None):
                     continue
                 if (since and ts < since) or (until and ts >= until):
                     continue
-                A.feed(ts, data, r.get("ndev") if USE_DEVICE_COUNT else None, r)
+                devs = r.get("devs")
+                if devs:
+                    for ip, mac in devs.items():
+                        A.mac_ip[mac] = ip
+                    if const is not None:
+                        people = sum(1 for m in devs.values() if m not in const)
+                dev = (people if const is not None and r.get("ndev") is not None
+                       else None)
+                A.feed(ts, data, dev, r)
     A.finish()
     if A.first is not None:
         try:
