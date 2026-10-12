@@ -158,6 +158,7 @@ HOST_LOG_DIR   = os.environ.get("NETDIAG_HOST_LOG", "/host_log")
 SEC_STALE_DAYS = 3      # журнал без записей дольше этого считается неведущимся
 OUT_REPORT = f"{WORK_DIR}/report.txt"
 OUT_HTML   = f"{WORK_DIR}/report.html"
+OUT_FULL   = f"{WORK_DIR}/report-full.txt"   # подробный технический
 HEARTBEAT  = f"{WORK_DIR}/heartbeat"
 # ================
 
@@ -2435,349 +2436,214 @@ def build_timeline(A):
     return points, ticks, pos, step_min
 
 
-EVENT_KINDS = {
-    "outage": {"ru": "Полный обрыв интернета", "az": "İnternetin tam kəsilməsi"},
-    "dns": {"ru": "Отказ DNS роутера", "az": "Routerin DNS-i cavab vermədi"},
-    "partial": {"ru": "Частичная потеря связи", "az": "Əlaqənin qismən itməsi"},
-    "gwmute": {"ru": "Роутер молчал по локальной сети",
-               "az": "Router lokal şəbəkədə cavab vermirdi"},
-}
-EVENT_NOTES = {
-    "dns": {"ru": "Интернет по IP в это время работал",
-            "az": "Bu vaxt IP üzrə internet işləyirdi"},
-    "partial": {"ru": "Недоступна часть внешних ресурсов",
-                "az": "Xarici resursların bir hissəsi əlçatmaz idi"},
-    "gwmute": {"ru": "Интернет в это время работал",
-               "az": "Bu vaxt internet işləyirdi"},
-}
+# ---------- короткий отчёт для руководства ----------
+# Две части: сеть (что с ней не так) и сервер диагностики. В каждой —
+# несколько фраз простым языком и один график. Всё подробное — в
+# report-full.txt.
+
+def _times(r):
+    n = int(round(r))
+    return f"{n} раза" if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14 else f"{n} раз"
 
 
-def _cap(t):
-    return t[:1].upper() + t[1:] if t else ""
+def _net_x(cidr):
+    return cidr.split("/")[0].rsplit(".", 1)[0] + ".x"
 
 
-def _num(x):
-    return f"{x:.2f}%".replace(".", ",")
+def _day_night(A):
+    """Статистика за часы занятий и за остальное время."""
+    work, off = _stat(), _stat()
+    for h in range(24):
+        dst = work if WORK_HOURS[0] <= h < WORK_HOURS[1] else off
+        for k in ("n", "bad", "dns_try", "dns_lost"):
+            dst[k] += A.hour[h][k]
+    return work, off
 
 
-def render_html(A, text_report):
-    import html as _html
+def brief(A):
+    """Выводы для короткого отчёта: {"net": {...}, "srv": {...}}, каждая
+    фраза — {"ru": ..., "az": ...}. Вызывать после render(A)."""
     T = A.total
-    points, ticks, pos, step_min = build_timeline(A)
-    ext_base = quantile(T["ext"], 0.5)
-    thr = (max(SLOW_FACTOR * ext_base, ext_base + SLOW_MIN_MS)
-           if ext_base is not None else None)
-
-    events = []
-    for e in A.events:
-        if e["kind"] not in EVENT_KINDS:
-            continue
-        if e["kind"] != "outage" and e["dur"] < OUTAGE_MIN_SEC:
-            continue
-        if e.get("text"):
-            note = {"ru": e["text"], "az": e.get("text_az", e["text"])}
-        else:
-            note = EVENT_NOTES.get(e["kind"], {"ru": "", "az": ""})
-        if e["kind"] == "dns" and e["ctl_try"]:
-            if e["ctl_lost"] == 0:
-                note = {"ru": "Контрольный DNS в это время отвечал — отказ на "
-                              "стороне роутера",
-                        "az": "Nəzarət DNS-i bu vaxt cavab verirdi — nasazlıq "
-                              "router tərəfindədir"}
-            else:
-                note = {"ru": f"Контрольный DNS тоже терял запросы "
-                              f"({e['ctl_lost']} из {e['ctl_try']})",
-                        "az": f"Nəzarət DNS-i də sorğuları itirirdi "
-                              f"({e['ctl_try']} sorğudan {e['ctl_lost']})"}
-        black = e["sec"]["blackout"]
-        events.append({
-            "t": e["start"],
-            "a": round(pos(e["start"]), 3), "b": round(pos(e["end"]), 3),
-            "start": fmt_dt(e["start"]),
-            "dur": {
-                "ru": fmt_dur(e["dur"]) + (
-                    f" (без интернета {fmt_dur(black)})"
-                    if e["kind"] == "outage" else ""),
-                "az": fmt_dur(e["dur"], "az") + (
-                    f" (internetsiz {fmt_dur(black, 'az')})"
-                    if e["kind"] == "outage" else "")},
-            "kind": EVENT_KINDS[e["kind"]],
-            "note": {k: _cap(v) for k, v in note.items()},
-        })
-    F = getattr(A, "findings", None) or extra_findings(A)
-    for r in F["resets"]:
-        events.append({
-            "t": r["ts"], "a": round(pos(r["ts"]), 3), "b": round(pos(r["ts"]), 3),
-            "start": fmt_dt(r["ts"]), "dur": {"ru": "—", "az": "—"},
-            "kind": {"ru": "Соединение с провайдером переустановлено",
-                     "az": "Provayderlə əlaqə yenidən qurulub"},
-            "note": ({"ru": "Роутер в это время пропадал и из локальной сети — "
-                            "перезагрузка роутера. До этого соединение "
-                            f"держалось {fmt_dur(r['up'])}",
-                      "az": "Bu vaxt router lokal şəbəkədən də itmişdi — router "
-                            "yenidən yüklənib. Bundan əvvəl əlaqə "
-                            f"{fmt_dur(r['up'], 'az')} davam edib"}
-                     if r["reboot"] else
-                     {"ru": "Роутер по локальной сети отвечал — переподключилась "
-                            "только линия провайдера. До этого соединение "
-                            f"держалось {fmt_dur(r['up'])}",
-                      "az": "Router lokal şəbəkədə cavab verirdi — yalnız "
-                            "provayder xətti yenidən qoşulub. Bundan əvvəl əlaqə "
-                            f"{fmt_dur(r['up'], 'az')} davam edib"})})
-    for i in F["infra"]:
-        end = i["end"] or A.last
-        sec = (end - i["start"]).total_seconds()
-        events.append({
-            "t": i["start"], "a": round(pos(i["start"]), 3), "b": round(pos(end), 3),
-            "start": fmt_dt(i["start"]),
-            "dur": ({"ru": fmt_dur(sec), "az": fmt_dur(sec, "az")} if i["end"] else
-                    {"ru": "до конца периода", "az": "dövrün sonunadək"}),
-            "kind": {"ru": "Постоянное устройство пропало из сети",
-                     "az": "Daimi cihaz şəbəkədən itdi"},
-            "note": {"ru": dev_label(i["mac"], i["ip"]),
-                     "az": dev_label(i["mac"], i["ip"], "az")}})
-    for ts, left, tot, back in F["drops"]:
-        events.append({
-            "t": ts, "a": round(pos(ts), 3), "b": round(pos(ts), 3),
-            "start": fmt_dt(ts), "dur": {"ru": "—", "az": "—"},
-            "kind": {"ru": "Массовое отключение устройств",
-                     "az": "Cihazların kütləvi ayrılması"},
-            "note": {"ru": f"За один подсчёт пропало {left} из {tot} устройств, "
-                           f"{back} вернулось за {DROP_BACK_SCANS} минут — "
-                           "признак того, что точка доступа сбросила клиентов",
-                     "az": f"Bir sayım ərzində {tot} cihazdan {left} cihaz itib, "
-                           f"{DROP_BACK_SCANS} dəqiqə ərzində {back} cihaz "
-                           "qayıdıb — giriş nöqtəsinin müştəriləri atmasının "
-                           "əlaməti"}})
-    for st in A.storms:
-        top = st["top"][0][0] if st["top"] else None
-        who = mac_label(A, top) if top else None
-        sec = (st["end"] - st["start"]).total_seconds()
-        events.append({
-            "t": st["start"], "a": round(pos(st["start"]), 3),
-            "b": round(pos(st["end"]), 3), "start": fmt_dt(st["start"]),
-            "dur": {"ru": fmt_dur(sec), "az": fmt_dur(sec, "az")},
-            "kind": {"ru": "Всплеск широковещательного трафика",
-                     "az": "Yayım trafikinin sıçrayışı"},
-            "note": {"ru": f"До {st['pps']:.0f} пакетов в секунду — петля или "
-                           "шторм в локальной сети"
-                           + (f"; больше всех слал {who}" if who else "")
-                           + ("; в это время был сбой" if st.get("hit") else ""),
-                     "az": f"Saniyədə {st['pps']:.0f} paketədək — lokal şəbəkədə "
-                           "ilgək və ya fırtına"
-                           + (f"; ən çox göndərən: {who}" if who else "")
-                           + ("; bu vaxt nasazlıq olub" if st.get("hit") else "")}})
-    for ts, ip, mac, n in A.arpdups:
-        events.append({
-            "t": ts, "a": round(pos(ts), 3), "b": round(pos(ts), 3),
-            "start": fmt_dt(ts), "dur": {"ru": "—", "az": "—"},
-            "kind": {"ru": "Многократный ответ на ARP-запрос",
-                     "az": "ARP sorğusuna çoxsaylı cavab"},
-            "note": {"ru": f"{dev_label(mac, ip)}: "
-                           f"{plural(n, 'ответ', 'ответа', 'ответов')} на один запрос — "
-                           "признак петли в сети",
-                     "az": f"{dev_label(mac, ip, 'az')}: bir sorğuya {n} cavab — "
-                           "şəbəkədə ilgək əlaməti"}})
-    events.sort(key=lambda x: x["t"])
-    for x in events:
-        del x["t"]
-    gaps = [{"a": round(pos(st), 3), "b": round(pos(en), 3)}
-            for st, en, dt in A.gaps]
-
     outages = [e for e in A.events if e["kind"] == "outage"]
-    blips = sum(1 for e in A.events if e["kind"] == "blip")
-    black_all = sum(e["sec"]["blackout"] for e in outages)
-    tiles = [
-        {"k": {"ru": "Полных обрывов интернета", "az": "İnternetin tam kəsilməsi"},
-         "v": str(len(outages)),
-         "s": ({"ru": "суммарно " + fmt_dur(black_all),
-                "az": "cəmi " + fmt_dur(black_all, "az")} if outages else
-               {"ru": f"коротких (до {OUTAGE_MIN_SEC} сек): {blips}",
-                "az": f"qısa ({OUTAGE_MIN_SEC} san-dək): {blips}"})},
-        {"k": {"ru": "Интернет был доступен", "az": "İnternet əlçatan olub"},
-         "v": _num(100 - pct(T["black_sec"], T["sec"])),
-         "s": {"ru": "времени наблюдения", "az": "müşahidə vaxtının"}},
-        {"k": {"ru": "Замеров с отклонениями", "az": "Kənarlaşma olan ölçmələr"},
-         "v": _num(pct(T["bad"], T["n"])),
-         "s": {"ru": f"из {T['n']}", "az": f"{T['n']} ölçmədən"}},
-    ]
-    if A.has_rdns:
-        tiles.append({
-            "k": {"ru": "DNS роутера: без ответа", "az": "Routerin DNS-i: cavabsız"},
-            "v": _num(pct(T["dns_lost"], T["dns_try"])),
-            "s": {"ru": f"{T['dns_lost']} из {T['dns_try']} запросов",
-                  "az": f"{T['dns_try']} sorğudan {T['dns_lost']}"}})
-    if thr is not None:
-        n_slow = sum(1 for x in T["ext"] if x >= thr)
-        tiles.append({
-            "k": {"ru": "Медленных замеров", "az": "Ləng ölçmələr"},
-            "v": _num(pct(n_slow, len(T["ext"]))),
-            "s": {"ru": f"задержка наружу от {thr:.0f} мс",
-                  "az": f"xaricə gecikmə {thr:.0f} ms və daha çox"}})
+    n_out = len(outages)
+    black = sum(e["sec"]["blackout"] for e in outages)
+    by_router = [e for e in outages if e.get("verdict") == "router"]
+    net, bad_net = [], False
 
-    MS = {"ru": "мс", "az": "ms"}
-    usual = {"ru": "Обычная задержка", "az": "Adi gecikmə"}
-    worst = {"ru": "5% худших замеров", "az": "Ən pis 5% ölçmə"}
-    charts = []
-    if T["dev_n"]:
-        dev_name = {"ru": "Устройства людей в основной сети (видимая часть)",
-                    "az": "Əsas şəbəkədə insanların cihazları (görünən hissə)"}
-        charts.append({
-            "title": dev_name, "unit": "", "type": "line", "floor": 5,
-            "series": [{"key": "dev", "name": dev_name, "c": 1}],
-            "note": {"ru": f"Устройства, ответившие на ARP-запрос сервера, без "
-                           f"{A.n_const} постоянных (серверы, виртуальные машины, "
-                           "роутеры, камеры)."
-                           + (" Большинство устройств людей подключено через "
-                              "вложенные роутеры (подсеть "
-                              f"{', '.join(HIDDEN_SUBNETS)}) и здесь не видно — "
-                              "реальное число в несколько раз больше."
-                              if HIDDEN_SUBNETS else ""),
-                     "az": f"Serverin ARP sorğusuna cavab verən cihazlar, "
-                           f"{A.n_const} daimi cihaz (serverlər, virtual maşınlar, "
-                           "routerlər, kameralar) çıxılmaqla."
-                           + (" İnsanların cihazlarının əksəriyyəti daxili "
-                              "routerlər vasitəsilə qoşulub (alt şəbəkə "
-                              f"{', '.join(HIDDEN_SUBNETS)}) və burada görünmür — "
-                              "real say bir neçə dəfə çoxdur."
-                              if HIDDEN_SUBNETS else "")}})
-    if T["scans"]:
-        charts.append({
-            "title": {"ru": "Смена состава устройств за минуту",
-                      "az": "Bir dəqiqədə cihaz tərkibinin dəyişməsi"},
-            "unit": "", "type": "line", "floor": 4,
-            "series": [{"key": "join", "c": 1,
-                        "name": {"ru": "Появилось", "az": "Qoşulub"}},
-                       {"key": "left", "c": 2,
-                        "name": {"ru": "Исчезло", "az": "Ayrılıb"}}],
-            "note": {"ru": "Сколько устройств в среднем появлялось и исчезало "
-                           "между соседними подсчётами. Всплеск «исчезло» при "
-                           "ровном числе людей — Wi-Fi сбрасывает клиентов.",
-                     "az": "Qonşu sayımlar arasında orta hesabla neçə cihazın "
-                           "qoşulduğu və ayrıldığı. İnsanların sayı sabit "
-                           "qalarkən «ayrılıb» sıçrayışı Wi-Fi-ın müştəriləri "
-                           "atdığını göstərir."}})
-    if T["bc_sec"]:
-        charts.append({
-            "title": {"ru": "Широковещательный трафик в сети",
-                      "az": "Şəbəkədə yayım trafiki"},
-            "unit": {"ru": "пак/с", "az": "paket/s"}, "type": "line", "floor": 20,
-            "series": [{"key": "bc", "c": 1,
-                        "name": {"ru": "В среднем", "az": "Orta hesabla"}},
-                       {"key": "bcmax", "c": 2,
-                        "name": {"ru": "Худшая минута", "az": "Ən pis dəqiqə"}}],
-            "note": {"ru": "Широковещательные и групповые пакеты, приходящие на "
-                           "сервер; сервер ничего не отправляет. Обычно их "
-                           f"единицы в секунду. Скачок до сотен и тысяч (от "
-                           f"{STORM_PPS}) — петля или шторм в локальной сети.",
-                     "az": "Serverə gələn yayım və qrup paketləri; server heç nə "
-                           "göndərmir. Adətən saniyədə bir neçə olur. Yüzlərlə "
-                           f"və minlərlə sıçrayış ({STORM_PPS}-dən) lokal "
-                           "şəbəkədə ilgək və ya fırtınadır."}})
-    if T["tr_sec"]:
-        charts.append({
-            "title": {"ru": "Трафик через роутер", "az": "Routerdən keçən trafik"},
-            "unit": {"ru": "Мбит/с", "az": "Mbit/s"}, "type": "line", "floor": 4,
-            "series": [{"key": "rx", "c": 1,
-                        "name": {"ru": "К нам (загрузка)", "az": "Bizə (yükləmə)"}},
-                       {"key": "tx", "c": 2,
-                        "name": {"ru": "От нас (отдача)", "az": "Bizdən (göndərmə)"}}],
-            "note": {"ru": "По счётчикам самого роутера (UPnP). Показывает "
-                           "реальную нагрузку на канал.",
-                     "az": "Routerin öz sayğaclarına görə (UPnP). Kanalın real "
-                           "yüklənməsini göstərir."}})
-    if T["b_n"]:
-        charts.append({
-            "title": {"ru": "Серии быстрых проб", "az": "Sürətli yoxlama seriyaları"},
-            "unit": MS, "type": "line", "floor": 50,
-            "series": [{"key": "bp50", "name": usual, "c": 1},
-                       {"key": "bmax", "c": 2,
-                        "name": {"ru": "Худшая в серии", "az": "Seriyada ən pisi"}}],
-            "note": {"ru": f"{BURST_COUNT} подключений подряд за две секунды, раз "
-                           "в минуту. Высокая «худшая» при обычной средней — "
-                           "короткие замирания.",
-                     "az": f"Dəqiqədə bir dəfə, iki saniyə ərzində ardıcıl "
-                           f"{BURST_COUNT} qoşulma. Orta göstərici adi qalarkən "
-                           "yüksək «ən pis» qısa donmaları göstərir."}})
-    if A.has_rdns:
-        series = [{"key": "dns", "c": 1,
-                   "name": {"ru": f"DNS роутера ({GATEWAY})",
-                            "az": f"Routerin DNS-i ({GATEWAY})"}}]
-        if T["ctl_try"]:
-            series.append({"key": "ctl", "c": 2,
-                           "name": {"ru": "Контроль: 8.8.8.8 мимо роутера",
-                                    "az": "Nəzarət: routerdən yan keçərək 8.8.8.8"}})
-        charts.append({
-            "title": {"ru": "DNS-запросы без ответа", "az": "Cavabsız DNS sorğuları"},
-            "unit": "%", "type": "line", "floor": 1, "series": series,
-            "note": {"ru": "Доля запросов, на которые не пришёл ответ. Рост "
-                           "у роутера при ровном контроле указывает на роутер.",
-                     "az": "Cavab gəlməyən sorğuların payı. Nəzarət xətti sabit "
-                           "qalarkən routerdə artım routerə işarə edir."}})
-    bad_name = {"ru": "Замеры с отклонениями", "az": "Kənarlaşma olan ölçmələr"}
-    charts.append({
-        "title": bad_name, "unit": "%", "type": "bar", "floor": 1,
-        "series": [{"key": "bad", "name": bad_name, "c": 1}],
-        "note": {"ru": "Доля замеров, в которых что-то не ответило: внешние "
-                       "ресурсы, DNS роутера или сам роутер.",
-                 "az": "Nəyinsə cavab vermədiyi ölçmələrin payı: xarici "
-                       "resurslar, routerin DNS-i və ya routerin özü."}})
-    charts.append({
-        "title": {"ru": "Ответ роутера по локальной сети",
-                  "az": "Routerin lokal şəbəkədə cavabı"},
-        "unit": MS, "type": "line", "floor": 10,
-        "series": [{"key": "rm", "name": usual, "c": 1},
-                   {"key": "r95", "name": worst, "c": 2}],
-        "note": {"ru": "Время TCP-подключения к роутеру. Рост в часы занятий "
-                       "— признак нагрузки на роутер.",
-                 "az": "Routerə TCP qoşulma vaxtı. Dərs saatlarında artım "
-                       "routerin yüklənməsinin əlamətidir."}})
-    charts.append({
-        "title": {"ru": "Задержка до внешних ресурсов",
-                  "az": "Xarici resurslara qədər gecikmə"},
-        "unit": MS, "type": "line", "floor": 50,
-        "series": [{"key": "em", "name": usual, "c": 1},
-                   {"key": "e95", "name": worst, "c": 2}],
-        "note": {"ru": "Время TCP-подключения к внешним серверам через роутер.",
-                 "az": "Router vasitəsilə xarici serverlərə TCP qoşulma vaxtı."}})
+    # 1. обрывы
+    if n_out:
+        bad_net = True
+        ru = (f"Интернет полностью пропадал {plural(n_out, 'раз', 'раза', 'раз')}, "
+              f"всего на {fmt_dur(black)}.")
+        az = (f"İnternet {n_out} dəfə tamamilə itib, cəmi "
+              f"{fmt_dur(black, 'az')}.")
+        if by_router:
+            t = by_router[-1]["start"]
+            last = t.strftime("%d.%m в %H:%M")
+            last_az = t.strftime("%d.%m, saat %H:%M")
+            if len(by_router) == n_out:
+                ru += (" Виноват основной роутер: он сам пропадал из сети"
+                       f" (последний раз — {last}).")
+                az += (" Səbəb əsas routerdir: o, özü şəbəkədən itib"
+                       f" (sonuncu dəfə — {last_az}).")
+            else:
+                ru += (f" Из них {len(by_router)} — по вине основного роутера: "
+                       f"он сам пропадал из сети (последний раз — {last}).")
+                az += (f" Onlardan {len(by_router)} — əsas routerin "
+                       f"günahından: o, özü şəbəkədən itib (sonuncu dəfə — {last_az}).")
+        net.append({"ru": ru, "az": az})
+    else:
+        net.append({"ru": "Полностью интернет не пропадал.",
+                    "az": "İnternet tamamilə itməyib."})
 
+    # 2. зависимость от нагрузки
+    work, off = _day_night(A)
+    if work["n"] >= 720 and off["n"] >= 720:
+        hours = f"{WORK_HOURS[0]}:00–{WORK_HOURS[1]}:00"
+        p_hi, p_lo = pct(work["bad"], work["n"]), pct(off["bad"], off["n"])
+        d_hi = pct(work["dns_lost"], work["dns_try"]) if work["dns_try"] else 0
+        d_lo = pct(off["dns_lost"], off["dns_try"]) if off["dns_try"] else 0
+        err = p_hi >= 0.3 and p_hi >= 2 * max(p_lo, 0.05)
+        dns = A.has_rdns and d_hi >= 0.5 and d_hi >= 3 * max(d_lo, 0.05)
+        if err or dns:
+            bad_net = True
+            ru = f"Днём ({hours}), когда в академии люди, сеть работает хуже: "
+            az = f"Gündüz ({hours}), akademiyada insanlar olanda, şəbəkə pis işləyir: "
+            bits, bits_az = [], []
+            if err:
+                r = p_hi / max(p_lo, 0.05)
+                bits.append(f"ошибок в {_times(r)} больше, чем ночью "
+                            f"({p_hi:.1f}% замеров против {p_lo:.1f}%)")
+                bits_az.append(f"səhvlər gecədən {r:.0f} dəfə çoxdur "
+                               f"({p_hi:.1f}% ölçmə, gecə {p_lo:.1f}%)")
+            if dns:
+                r2 = d_hi / max(d_lo, 0.05)
+                bits.append(f"основной роутер не справляется с нагрузкой и не "
+                            f"отвечает на запросы в {_times(r2)} чаще, чем ночью")
+                bits_az.append(f"əsas router yüklənməyə tab gətirmir və sorğulara "
+                               f"gecədən {r2:.0f} dəfə daha tez-tez cavab vermir")
+            net.append({"ru": ru + "; ".join(bits) + ".",
+                        "az": az + "; ".join(bits_az) + "."})
+
+    # 3. петли и штормы
+    if A.storms:
+        bad_net = True
+        n_hit = sum(1 for st in A.storms if st.get("hit"))
+        ru = (f"В сети случались «штормы» — лавина служебных пакетов, которая "
+              f"забивает сеть: {plural(len(A.storms), 'раз', 'раза', 'раз')}"
+              + (f" (во время сбоев — {n_hit})." if n_hit else "."))
+        az = (f"Şəbəkədə «fırtınalar» olub — şəbəkəni tıxayan xidməti paket "
+              f"axını: {len(A.storms)} dəfə"
+              + (f" (nasazlıqlar zamanı — {n_hit})." if n_hit else "."))
+        net.append({"ru": ru, "az": az})
+
+    # 4. как собрана сеть
+    if HIDDEN_SUBNETS:
+        bad_net = True
+        nets = ", ".join([_net_x(LAN_NET)] + [_net_x(x) for x in HIDDEN_SUBNETS])
+        net.append({
+            "ru": "Сеть собрана неправильно: под одним Wi-Fi работают разные "
+                  f"сети ({nets}) — роутер стоит за роутером. Поэтому в разных "
+                  "комнатах интернет разный, а большинство подключённых "
+                  "устройств сеть даже не видит.",
+            "az": "Şəbəkə səhv qurulub: bir Wi-Fi altında müxtəlif şəbəkələr "
+                  f"işləyir ({nets}) — router routerin arxasında dayanır. Ona "
+                  "görə də müxtəlif otaqlarda internet fərqlidir, qoşulmuş "
+                  "cihazların əksəriyyətini isə şəbəkə heç görmür."})
+
+    net_head = ({"ru": "Сеть академии работает нестабильно",
+                 "az": "Akademiyanın şəbəkəsi qeyri-sabit işləyir"} if bad_net else
+                {"ru": "Серьёзных проблем в сети не найдено",
+                 "az": "Şəbəkədə ciddi problem tapılmayıb"})
+
+    # ---------- сервер ----------
+    srv, bad_srv = [], False
     if T["sys_n"]:
-        charts.append({
-            "title": {"ru": "Нагрузка сервера диагностики",
-                      "az": "Diaqnostika serverinin yüklənməsi"},
-            "unit": "%", "type": "line", "floor": 100,
-            "series": [{"key": "cpu", "c": 1,
-                        "name": {"ru": "Процессор", "az": "Prosessor"}},
-                       {"key": "mem", "c": 2,
-                        "name": {"ru": "Память", "az": "Yaddaş (RAM)"}}],
-            "note": {"ru": "Загрузка процессора и занятая оперативная память "
-                           "сервера, на котором работает диагностика.",
-                     "az": "Diaqnostikanın işlədiyi serverin prosessor "
-                           "yüklənməsi və istifadə olunan operativ yaddaş."}})
+        cpu, cpu_m = T["cpu_sum"] / T["sys_n"], T["cpu_max"]
+        mem, mem_m = T["mem_sum"] / T["sys_n"], T["mem_max"]
+        heavy = cpu >= 50 or mem >= 85
+        bad_srv |= heavy
+        srv.append({
+            "ru": ("Сервер загружен" if heavy else "Нагрузка небольшая")
+                  + f": процессор в среднем {cpu:.0f}% (максимум {cpu_m:.0f}%), "
+                  f"память {mem:.0f}% (максимум {mem_m:.0f}%).",
+            "az": ("Server yüklənib" if heavy else "Yüklənmə azdır")
+                  + f": prosessor orta hesabla {cpu:.0f}% (maksimum {cpu_m:.0f}%), "
+                  f"yaddaş {mem:.0f}% (maksimum {mem_m:.0f}%)."})
     SV = getattr(A, "server", None) or server_summary(A)
-    disk = None
     if SV:
-        disk = {"pct": SV["pct"], "level": SV["level"], "line": SV["line"],
-                "state": SV["state"], "rec": SV["rec"], "log": SV["log"]}
+        bad_srv |= SV["level"] != "ok"
+        srv.append({
+            "ru": f"Диск: свободно {fmt_bytes(SV['free'])} из "
+                  f"{fmt_bytes(SV['total'])} — {SV['state']['ru']}. "
+                  + ("" if SV["level"] == "ok" else SV["rec"]["ru"]),
+            "az": f"Disk: {fmt_bytes(SV['total'], 'az')}-dan "
+                  f"{fmt_bytes(SV['free'], 'az')} boşdur — {SV['state']['az']}. "
+                  + ("" if SV["level"] == "ok" else SV["rec"]["az"])})
+    R = getattr(A, "security", None)
+    if R:
+        hits = R["ufw_in"] + R["ssh_fail"] + R["found"]
+        bad_srv |= R["ban"] > 0
+        if hits == 0:
+            ru = ("Атак не было: попыток подключиться к серверу снаружи — 0, "
+                  "неудачных входов — 0.")
+            az = ("Hücum olmayıb: serverə kənardan qoşulma cəhdi — 0, "
+                  "uğursuz giriş — 0.")
+        else:
+            ru = (f"Были попытки проникнуть на сервер: заблокировано подключений "
+                  f"{R['ufw_in']}, неудачных входов {R['ssh_fail']}, "
+                  f"заблокировано адресов {R['ban']}.")
+            az = (f"Serverə daxil olmaq cəhdləri olub: bloklanmış qoşulmalar "
+                  f"{R['ufw_in']}, uğursuz girişlər {R['ssh_fail']}, "
+                  f"bloklanmış ünvanlar {R['ban']}.")
+        if R.get("syslog_stale"):
+            bad_srv = True
+            ru += " Журналы сервера не пишутся — проверить rsyslog."
+            az += " Serverin jurnalları yazılmır — rsyslog-u yoxlamaq lazımdır."
+        srv.append({"ru": ru, "az": az})
+    if not srv:
+        srv.append({"ru": "Данных о сервере за этот период нет.",
+                    "az": "Bu dövr üçün server haqqında məlumat yoxdur."})
+    srv_head = ({"ru": "Сервер диагностики требует внимания",
+                 "az": "Diaqnostika serveri diqqət tələb edir"} if bad_srv else
+                {"ru": "Сервер диагностики работает нормально",
+                 "az": "Diaqnostika serveri normal işləyir"})
+    return {"net": {"head": net_head, "lines": net},
+            "srv": {"head": srv_head, "lines": srv}}
 
-    concl_ru = getattr(A, "conclusions", [])
-    concl_az = getattr(A, "conclusions_az", concl_ru)
+
+def render_brief(A, B):
+    L = ["ОТЧЁТ NETDIAG",
+         f"{A.first:%d.%m.%y %H:%M} — {A.last:%d.%m.%y %H:%M}",
+         ""]
+    for part in ("net", "srv"):
+        L.append(B[part]["head"]["ru"].upper())
+        for ln in B[part]["lines"]:
+            L += wrap("• " + ln["ru"], 76, "  ", "    ")
+        L.append("")
+    L.append("Подробный технический отчёт: report-full.txt")
+    return "\n".join(L) + "\n"
+
+
+def render_html(A, B):
+    points, ticks, pos, step_min = build_timeline(A)
+    # ошибки: доля запросов к роутеру без ответа (лучше всего видна нагрузка);
+    # если DNS роутера не проверялся — доля замеров с отклонениями
+    key = "dns" if A.has_rdns else "bad"
+    net_pts = [{"l": p["label"], "v": p.get(key), "e": p.get("bad"),
+                "o": bool(p.get("black"))}
+               if p["n"] else {"l": p["label"]} for p in points]
+    srv_pts = [{"l": p["label"], "a": p.get("cpu"), "b": p.get("mem")}
+               if p["n"] else {"l": p["label"]} for p in points]
     data = {
-        "from": fmt_dt(A.first), "to": fmt_dt(A.last),
-        "observed": both(lambda lg: fmt_dur(T["sec"], lg)), "samples": T["n"],
-        "step": ({"ru": f"{step_min} мин", "az": f"{step_min} dəq"}
-                 if step_min < 60 else
-                 {"ru": f"{step_min // 60} ч", "az": f"{step_min // 60} saat"}),
-        "points": points, "ticks": ticks, "events": events, "gaps": gaps,
-        "tiles": tiles, "charts": charts,
-        "conclusions": [{"ru": r, "az": z} for r, z in zip(concl_ru, concl_az)],
-        "disk": disk,
-        "sec": getattr(A, "sec_lines", []),
+        "period": {"ru": f"{A.first:%d.%m.%y %H:%M} — {A.last:%d.%m.%y %H:%M}",
+                   "az": f"{A.first:%d.%m.%y %H:%M} — {A.last:%d.%m.%y %H:%M}"},
+        "net": B["net"], "srv": B["srv"], "ticks": ticks, "rdns": A.has_rdns,
+        "netPts": net_pts,
+        "srvPts": srv_pts if A.total["sys_n"] else None,
     }
     blob = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
-    return (HTML_TEMPLATE
-            .replace("__DATA__", blob)
-            .replace("__TEXT__", _html.escape(text_report)))
+    return HTML_TEMPLATE.replace("__DATA__", blob)
 
 
 HTML_TEMPLATE = r"""<!doctype html>
@@ -2791,362 +2657,189 @@ HTML_TEMPLATE = r"""<!doctype html>
   color-scheme: light;
   --page: #f4f3f0; --surface: #fcfcfb; --border: #e3e1db;
   --text: #0b0b0b; --text2: #52514e; --muted: #8a8880; --grid: #e9e7e1;
-  --s1: #2a78d6; --s2: #eb6834; --critical: #d03b3b; --gap: #8a8880;
+  --s1: #2a78d6; --s2: #eb6834; --bad: #d03b3b; --ok: #2f8f4e;
 }
 @media (prefers-color-scheme: dark) {
   :root {
     color-scheme: dark;
     --page: #111110; --surface: #1a1a19; --border: #33322f;
     --text: #f0efec; --text2: #c3c2b7; --muted: #8a8880; --grid: #2a2a28;
-    --s1: #3987e5; --s2: #d95926; --critical: #d03b3b; --gap: #8a8880;
+    --s1: #3987e5; --s2: #d95926; --bad: #e05252; --ok: #4fb46d;
   }
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--page); color: var(--text);
-  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
-main { max-width: 1100px; margin: 0 auto; padding: 24px 16px 48px; }
-h1 { font-size: 22px; margin: 0; }
-.top { display: flex; align-items: center; justify-content: space-between;
-  gap: 12px; margin-bottom: 4px; }
-.langs { display: flex; gap: 6px; flex: none; }
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+main { max-width: 980px; margin: 0 auto; padding: 24px 16px 40px; }
+.top { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+h1 { font-size: 20px; margin: 0; }
+.period { color: var(--muted); margin: 2px 0 20px; font-size: 13px; }
+.langs { display: flex; gap: 6px; }
 .langs button { padding: 2px; border: 2px solid transparent; border-radius: 6px;
   background: none; cursor: pointer; line-height: 0; opacity: .55; }
-.langs button svg { display: block; width: 30px; height: 20px; border-radius: 3px;
+.langs button svg { width: 30px; height: 20px; border-radius: 3px;
   box-shadow: 0 0 0 1px var(--border); }
-.langs button:hover { opacity: .85; }
 .langs button[aria-pressed="true"] { border-color: var(--text); opacity: 1; }
-.langs button:focus-visible { outline: 2px solid var(--s1); outline-offset: 2px; }
-h2 { font-size: 15px; margin: 0; }
-.sub { color: var(--text2); margin: 0 0 20px; }
-.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
-  gap: 12px; margin-bottom: 16px; }
-.tile, .card { background: var(--surface); border: 1px solid var(--border);
-  border-radius: 10px; }
-.tile { padding: 12px 14px; }
-.tile .k { color: var(--text2); font-size: 12px; }
-.tile .v { font-size: 26px; font-weight: 600; font-variant-numeric: tabular-nums;
-  margin: 2px 0; }
-.tile .s { color: var(--muted); font-size: 12px; }
-.key { display: flex; flex-wrap: wrap; gap: 6px 18px; color: var(--text2);
-  font-size: 12px; margin: 0 2px 16px; }
-.key span { display: inline-flex; align-items: center; gap: 6px; }
-.sw { width: 14px; height: 10px; border-radius: 2px; display: inline-block; }
-.sw.ev { background: var(--critical); opacity: .28; }
-.sw.gp { background: var(--gap); opacity: .28; }
-.card { padding: 14px 14px 8px; margin-bottom: 14px; position: relative; }
-.note { color: var(--text2); font-size: 12px; margin: 2px 0 8px; max-width: 760px; }
-.legend { display: flex; flex-wrap: wrap; gap: 4px 16px; font-size: 12px;
+section { background: var(--surface); border: 1px solid var(--border);
+  border-radius: 12px; padding: 18px 18px 10px; margin-bottom: 16px; position: relative; }
+h2 { font-size: 19px; margin: 0 0 10px; display: flex; align-items: center; gap: 10px; }
+h2 i { width: 12px; height: 12px; border-radius: 50%; flex: none; }
+h2.bad i { background: var(--bad); } h2.ok i { background: var(--ok); }
+ul { margin: 0 0 14px; padding-left: 20px; }
+li { margin: 4px 0; max-width: 820px; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 18px; font-size: 12px;
   color: var(--text2); margin-bottom: 4px; }
-.legend i { width: 14px; height: 3px; border-radius: 2px; display: inline-block;
-  vertical-align: middle; margin-right: 6px; }
-svg { display: block; width: 100%; height: auto; overflow: visible; }
-svg text { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.legend i { width: 12px; height: 10px; border-radius: 2px; display: inline-block;
+  vertical-align: -1px; margin-right: 6px; }
+svg.chart { display: block; width: 100%; height: auto; overflow: visible; }
+svg.chart text { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
 .tip { position: absolute; pointer-events: none; background: var(--surface);
-  border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px;
-  font-size: 12px; box-shadow: 0 4px 14px rgba(0,0,0,.14); white-space: nowrap;
-  display: none; z-index: 5; }
-.tip b { font-variant-numeric: tabular-nums; }
-.tip .t { color: var(--text2); margin-bottom: 4px; }
-.tip .r { display: flex; align-items: center; gap: 6px; }
-.tip .r i { width: 10px; height: 3px; border-radius: 2px; display: inline-block; }
-.tip .n { color: var(--muted); margin-top: 4px; }
-table { border-collapse: collapse; width: 100%; font-size: 13px; }
-th, td { text-align: left; padding: 6px 10px 6px 0; border-bottom: 1px solid var(--border);
-  vertical-align: top; }
-th { color: var(--text2); font-weight: 500; font-size: 12px; }
-td.num { font-variant-numeric: tabular-nums; }
-td.num:first-child { white-space: nowrap; }
-.scroll { overflow-x: auto; }
-details { margin-top: 14px; }
-summary { cursor: pointer; color: var(--text2); }
-pre { background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
-  padding: 14px; overflow-x: auto; font-size: 12px; line-height: 1.4; }
-.empty { color: var(--text2); padding: 4px 0 8px; }
-.disk-line { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px;
-  margin: 6px 0 8px; font-variant-numeric: tabular-nums; }
-.badge { font-size: 12px; padding: 1px 8px; border-radius: 10px;
-  border: 1px solid var(--border); color: var(--text2); }
-.badge::before { content: "● "; color: var(--lvl, var(--s1)); }
-.meter { height: 10px; border-radius: 5px; background: var(--grid); overflow: hidden;
-  max-width: 620px; margin-bottom: 8px; }
-.meter i { display: block; height: 100%; border-radius: 5px 0 0 5px;
-  background: var(--lvl, var(--s1)); }
-#disk-card, #sec-card { padding-bottom: 12px; }
-#sec-lines .note { margin-top: 6px; color: var(--text); font-size: 13px; }
-ol { margin: 8px 0 6px; padding-left: 22px; max-width: 860px; }
-ol li { margin-bottom: 6px; }
+  border: 1px solid var(--border); border-radius: 8px; padding: 6px 9px; font-size: 12px;
+  box-shadow: 0 4px 14px rgba(0,0,0,.14); white-space: nowrap; display: none; z-index: 5; }
+.tip .t { color: var(--text2); }
+.foot { color: var(--muted); font-size: 12px; }
 </style>
 </head>
 <body>
 <main>
-  <header class="top">
-    <h1 id="title"></h1>
-    <div class="langs" role="group" aria-label="Язык / Dil">
-      <button type="button" data-lang="ru" title="Русский" aria-label="Русский"><svg viewBox="0 0 30 20" width="30" height="20" aria-hidden="true"><rect width="30" height="20" fill="#fff"/><rect y="6.67" width="30" height="6.67" fill="#0039a6"/><rect y="13.33" width="30" height="6.67" fill="#d52b1e"/></svg></button>
-      <button type="button" data-lang="az" title="Azərbaycan dili" aria-label="Azərbaycan dili"><svg viewBox="0 0 30 20" width="30" height="20" aria-hidden="true"><rect width="30" height="20" fill="#ef3340"/><rect width="30" height="6.67" fill="#00b5e2"/><rect y="13.33" width="30" height="6.67" fill="#509e2f"/><circle cx="13.6" cy="10" r="3" fill="#fff"/><circle cx="14.5" cy="10" r="2.45" fill="#ef3340"/><polygon points="17.10,8.25 17.43,9.21 18.34,8.76 17.89,9.67 18.85,10.00 17.89,10.33 18.34,11.24 17.43,10.79 17.10,11.75 16.77,10.79 15.86,11.24 16.31,10.33 15.35,10.00 16.31,9.67 15.86,8.76 16.77,9.21" fill="#fff"/></svg></button>
+  <div class="top">
+    <h1>NetDiag</h1>
+    <div class="langs">
+      <button data-lang="ru" aria-label="Русский"><svg viewBox="0 0 3 2"><rect width="3" height="2" fill="#fff"/><rect y=".667" width="3" height=".667" fill="#0039a6"/><rect y="1.333" width="3" height=".667" fill="#d52b1e"/></svg></button>
+      <button data-lang="az" aria-label="Azərbaycan"><svg viewBox="0 0 3 2"><rect width="3" height="2" fill="#509e2f"/><rect width="3" height="1.333" fill="#ef3340"/><rect width="3" height=".667" fill="#00b5e2"/><circle cx="1.42" cy="1" r=".3" fill="#fff"/><circle cx="1.49" cy="1" r=".24" fill="#ef3340"/><polygon fill="#fff" points="1.78,0.88 1.80,0.95 1.87,0.94 1.82,0.99 1.86,1.05 1.79,1.03 1.76,1.10 1.73,1.03 1.66,1.05 1.70,0.99 1.65,0.94 1.72,0.95"/></svg></button>
     </div>
-  </header>
-  <p class="sub" id="sub"></p>
-  <div class="tiles" id="tiles"></div>
-  <div class="card" id="concl-card">
-    <h2 id="concl-title"></h2>
-    <ol id="concl"></ol>
   </div>
-  <div class="key">
-    <span><i class="sw ev"></i><span id="key-ev"></span></span>
-    <span><i class="sw gp"></i><span id="key-gap"></span></span>
-    <span id="stepnote"></span>
-  </div>
-  <div id="charts"></div>
-  <div class="card" id="disk-card">
-    <h2 id="disk-title"></h2>
-    <div class="disk-line"><span id="disk-line"></span><span class="badge" id="disk-state"></span></div>
-    <div class="meter" role="img" id="disk-meter"><i id="disk-fill"></i></div>
-    <div class="note" id="disk-rec"></div>
-    <div class="note" id="disk-log"></div>
-  </div>
-  <div class="card" id="sec-card">
-    <h2 id="sec-title"></h2>
-    <div id="sec-lines"></div>
-  </div>
-  <div class="card">
-    <h2 id="ev-title"></h2>
-    <div class="note" id="ev-note"></div>
-    <div class="scroll" id="events"></div>
-  </div>
-  <details>
-    <summary id="full-title"></summary>
-    <pre>__TEXT__</pre>
-  </details>
+  <div class="period" id="period"></div>
+  <section id="net"><h2></h2><ul></ul>
+    <div class="legend"><span><i style="background:var(--s1)"></i><b data-t="errLeg"></b></span>
+      <span><i style="background:var(--bad)"></i><b data-t="outLeg"></b></span></div>
+    <div class="plot"></div><div class="tip"></div></section>
+  <section id="srv"><h2></h2><ul></ul>
+    <div class="legend"><span><i style="background:var(--s1)"></i><b data-t="cpu"></b></span>
+      <span><i style="background:var(--s2)"></i><b data-t="mem"></b></span></div>
+    <div class="plot"></div><div class="tip"></div></section>
+  <div class="foot" data-t="foot"></div>
 </main>
-<script type="application/json" id="data">__DATA__</script>
 <script>
 (function () {
-  var D = JSON.parse(document.getElementById('data').textContent);
-  var NS = 'http://www.w3.org/2000/svg';
-  var N = D.points.length;
-  function el(tag, attrs, parent) {
-    var e = document.createElementNS(NS, tag);
-    for (var k in attrs) e.setAttribute(k, attrs[k]);
-    if (parent) parent.appendChild(e);
-    return e;
-  }
-  function h(tag, cls, text, parent) {
-    var e = document.createElement(tag);
-    if (cls) e.className = cls;
-    if (text != null) e.textContent = text;
-    if (parent) parent.appendChild(e);
-    return e;
-  }
-  function fmt(v, unit) {
-    if (v == null) return '—';
-    var s = (unit === '%' ? v.toFixed(2) : (v < 10 ? v.toFixed(1) : v.toFixed(0)));
-    return s.replace('.', ',') + ' ' + unit;
-  }
-  function nice(m) {
-    var p = Math.pow(10, Math.floor(Math.log10(m))), f = m / p;
-    var n = f <= 1 ? 1 : f <= 2 ? 2 : f <= 2.5 ? 2.5 : f <= 5 ? 5 : 10;
-    return n * p;
-  }
-
+  var D = __DATA__;
   var UI = {
-    ru: { title: 'NetDiag — отчёт', period: 'Период', obs: 'наблюдение', samples: 'замеров',
-          keyEv: 'красная полоса — событие из списка ниже',
-          keyGap: 'серая полоса — сервер не работал, замеров нет',
-          step: 'одна точка графика = ', concl: 'Что из этого следует', events: 'События',
-          evNote: 'Сбои длительностью от 30 секунд. На графиках отмечены красными полосами.',
-          noEvents: 'Событий за период нет.',
-          th: ['Начало', 'Длительность', 'Что произошло', 'Что наблюдалось'],
-          full: 'Полный текстовый отчёт с таблицами по часам',
-          noData: 'замеров нет', n: 'замеров: ', disk: 'Диск сервера диагностики',
-          sec: 'Безопасность сервера за период отчёта' },
-    az: { title: 'NetDiag — hesabat', period: 'Dövr', obs: 'müşahidə', samples: 'ölçmə sayı',
-          keyEv: 'qırmızı zolaq — aşağıdakı siyahıdan hadisə',
-          keyGap: 'boz zolaq — server işləmirdi, ölçmə yoxdur',
-          step: 'qrafikin bir nöqtəsi = ', concl: 'Bundan nə nəticə çıxır', events: 'Hadisələr',
-          evNote: '30 saniyədən uzun nasazlıqlar. Qrafiklərdə qırmızı zolaqlarla göstərilib.',
-          noEvents: 'Bu dövrdə hadisə olmayıb.',
-          th: ['Başlanğıc', 'Müddət', 'Nə baş verib', 'Nə müşahidə olunub'],
-          full: 'Saatlar üzrə cədvəllərlə tam mətn hesabatı (rus dilində)',
-          noData: 'ölçmə yoxdur', n: 'ölçmə sayı: ', disk: 'Diaqnostika serverinin diski',
-          sec: 'Hesabat dövründə serverin təhlükəsizliyi' }
+    ru: { errLeg: "Роутер не ответил, % запросов", errLeg2: "Ошибки, % замеров",
+          bad: "Замеров с ошибками", outLeg: "Интернет пропадал",
+          cpu: "Процессор, %", mem: "Память, %", noData: "нет данных",
+          foot: "Подробный технический отчёт — в файле report-full.txt рядом с этим." },
+    az: { errLeg: "Router cavab vermədi, sorğuların %-i", errLeg2: "Səhvlər, ölçmələrin %-i",
+          bad: "Səhvli ölçmələr", outLeg: "İnternet itib",
+          cpu: "Prosessor, %", mem: "Yaddaş, %", noData: "məlumat yoxdur",
+          foot: "Ətraflı texniki hesabat — yanındakı report-full.txt faylında." }
   };
-  var lang = 'ru';
-  try { lang = localStorage.getItem('netdiag-lang') || 'ru'; } catch (e) {}
-  if (!UI[lang]) lang = 'ru';
-  function T(x) { return (x && typeof x === 'object') ? (x[lang] != null ? x[lang] : x.ru) : x; }
-  function $(id) { return document.getElementById(id); }
-  var cards = [];
+  var lang = "ru";
+  try { lang = localStorage.getItem("netdiag-lang") || "ru"; } catch (e) {}
+  if (!UI[lang]) lang = "ru";
+  var NS = "http://www.w3.org/2000/svg";
+  function el(n, a, p) { var e = document.createElementNS(NS, n);
+    for (var k in a) e.setAttribute(k, a[k]); if (p) p.appendChild(e); return e; }
+  function nice(v) { var c = [1, 2, 4, 8, 12, 20, 40, 60, 80, 100]; for (var i = 0; i < c.length; i++) if (v <= c[i]) return c[i]; return Math.ceil(v / 100) * 100; }
 
-  function renderAll() {
-    var U = UI[lang];
-    document.documentElement.lang = lang;
-    document.title = U.title;
-    $('title').textContent = U.title;
-    $('sub').textContent = U.period + ': ' + D.from + ' – ' + D.to + ' · ' + U.obs + ' ' +
-      T(D.observed) + ' · ' + U.samples + ': ' + D.samples;
-    $('key-ev').textContent = U.keyEv; $('key-gap').textContent = U.keyGap;
-    $('stepnote').textContent = U.step + T(D.step);
-    $('concl-title').textContent = U.concl; $('ev-title').textContent = U.events;
-    $('ev-note').textContent = U.evNote; $('full-title').textContent = U.full;
-    [].forEach.call(document.querySelectorAll('.langs button'), function (b) {
-      b.setAttribute('aria-pressed', b.getAttribute('data-lang') === lang ? 'true' : 'false');
-    });
-
-    var tiles = $('tiles'); tiles.textContent = '';
-    D.tiles.forEach(function (t) {
-      var d = h('div', 'tile', null, tiles);
-      h('div', 'k', T(t.k), d); h('div', 'v', t.v, d); h('div', 's', T(t.s), d);
-    });
-
-    var cl = $('concl'); cl.textContent = '';
-    (D.conclusions || []).forEach(function (t) { h('li', null, T(t), cl); });
-    $('concl-card').style.display = (D.conclusions || []).length ? '' : 'none';
-
-    var ev = $('events'); ev.textContent = '';
-    if (!D.events.length) {
-      h('div', 'empty', U.noEvents, ev);
-    } else {
-      var tb = h('table', null, null, ev), tr = h('tr', null, null, tb);
-      U.th.forEach(function (x) { h('th', null, x, tr); });
-      D.events.forEach(function (e) {
-        var r = h('tr', null, null, tb);
-        h('td', 'num', e.start, r); h('td', 'num', T(e.dur), r);
-        h('td', null, T(e.kind), r); h('td', null, T(e.note), r);
-      });
-    }
-
-    var host = $('charts'); host.textContent = '';
-    cards = D.charts.map(function (c) {
-      var card = h('div', 'card', null, host);
-      h('h2', null, T(c.title) + (T(c.unit) ? ', ' + T(c.unit) : ''), card);
-      h('div', 'note', T(c.note), card);
-      if (c.series.length > 1) {
-        var lg = h('div', 'legend', null, card);
-        c.series.forEach(function (s) {
-          var sp = h('span', null, null, lg), i = h('i', null, null, sp);
-          i.style.background = 'var(--s' + s.c + ')';
-          sp.appendChild(document.createTextNode(T(s.name)));
-        });
-      }
-      var box = h('div', null, null, card);
-      var tip = h('div', 'tip', null, card);
-      return { c: c, card: card, box: box, tip: tip };
-    });
-    cards.forEach(draw);
-
-    var dk = D.disk;
-    $('disk-card').style.display = dk ? '' : 'none';
-    if (dk) {
-      var lvl = dk.level === 'crit' ? 'var(--critical)' : dk.level === 'warn' ? '#fab219' : 'var(--s1)';
-      $('disk-card').style.setProperty('--lvl', lvl);
-      $('disk-title').textContent = U.disk;
-      $('disk-line').textContent = T(dk.line);
-      $('disk-state').textContent = T(dk.state);
-      $('disk-fill').style.width = Math.max(1, Math.min(100, dk.pct)) + '%';
-      $('disk-meter').setAttribute('aria-label', T(dk.line));
-      $('disk-rec').textContent = T(dk.rec);
-      $('disk-log').textContent = dk.log ? T(dk.log) : '';
-    }
-    var sl = $('sec-lines'); sl.textContent = '';
-    $('sec-card').style.display = (D.sec || []).length ? '' : 'none';
-    $('sec-title').textContent = U.sec;
-    (D.sec || []).forEach(function (x) { h('div', 'note', T(x), sl); });
-  }
-  [].forEach.call(document.querySelectorAll('.langs button'), function (b) {
-    b.addEventListener('click', function () {
-      lang = b.getAttribute('data-lang');
-      try { localStorage.setItem('netdiag-lang', lang); } catch (e) {}
-      renderAll();
-    });
-  });
-
-  function draw(o) {
-    var c = o.c, W = Math.max(320, o.box.clientWidth), H = 190;
-    var m = { l: 46, r: 10, t: 8, b: 22 }, pw = W - m.l - m.r, ph = H - m.t - m.b;
-    o.box.textContent = '';
-    var svg = el('svg', { viewBox: '0 0 ' + W + ' ' + H, role: 'img', 'aria-label': T(c.title) }, o.box);
-    var max = c.floor;
-    D.points.forEach(function (p) { c.series.forEach(function (s) { if (p[s.key] != null && p[s.key] > max) max = p[s.key]; }); });
-    var step = nice(max / 4); max = step * 4;
-    var X = function (i) { return m.l + i / N * pw; };
-    var Y = function (v) { return m.t + ph - v / max * ph; };
-
+  function chart(sec, pts, opt) {
+    var box = sec.querySelector(".plot"), tip = sec.querySelector(".tip");
+    box.textContent = "";
+    if (!pts) { sec.querySelector(".legend").style.display = "none"; return; }
+    var W = Math.max(320, box.clientWidth), H = opt.h, m = { l: 36, r: 8, t: 8, b: 22 };
+    var pw = W - m.l - m.r, ph = H - m.t - m.b, N = pts.length;
+    var mx = opt.floor;
+    pts.forEach(function (p) { opt.keys.forEach(function (k) { if (p[k] != null && p[k] > mx) mx = p[k]; }); });
+    mx = nice(mx);
+    var svg = el("svg", { "class": "chart", viewBox: "0 0 " + W + " " + H }, box);
+    function X(i) { return m.l + i / N * pw; }
+    function Y(v) { return m.t + ph - v / mx * ph; }
     for (var g = 0; g <= 4; g++) {
-      var v = max * g / 4, y = Y(v);
-      el('line', { x1: m.l, x2: m.l + pw, y1: y, y2: y, stroke: 'var(--grid)', 'stroke-width': 1 }, svg);
-      var t = el('text', { x: m.l - 6, y: y + 4, 'text-anchor': 'end' }, svg);
-      t.textContent = String(+v.toFixed(3)).replace('.', ',');
+      var v = mx * g / 4, y = Y(v);
+      el("line", { x1: m.l, x2: W - m.r, y1: y, y2: y, stroke: "var(--grid)" }, svg);
+      var t = el("text", { x: m.l - 6, y: y + 4, "text-anchor": "end" }, svg);
+      t.textContent = (Math.round(v * 10) / 10) + "";
     }
-    D.ticks.forEach(function (k) {
-      var x = X(k.x);
-      el('line', { x1: x, x2: x, y1: m.t + ph, y2: m.t + ph + 4, stroke: 'var(--grid)' }, svg);
-      var t = el('text', { x: x, y: H - 6, 'text-anchor': 'middle' }, svg); t.textContent = k.label;
+    var step = Math.max(1, Math.ceil(D.ticks.length / Math.max(2, Math.floor(pw / 70))));
+    D.ticks.forEach(function (tk, i) {
+      if (i % step) return;
+      var t = el("text", { x: X(tk.x), y: H - 6, "text-anchor": "middle" }, svg);
+      t.textContent = tk.label;
     });
-    function band(a, b, color) {
-      var x1 = X(a), w = Math.max(2, X(b) - x1);
-      el('rect', { x: x1, y: m.t, width: w, height: ph, fill: color, opacity: .2 }, svg);
-    }
-    D.gaps.forEach(function (gp) { band(gp.a, gp.b, 'var(--gap)'); });
-    D.events.forEach(function (e) { band(e.a, e.b, 'var(--critical)'); });
-
-    c.series.forEach(function (s) {
-      var col = 'var(--s' + s.c + ')';
-      if (c.type === 'bar') {
-        var bw = Math.max(1, pw / N - 2);
-        D.points.forEach(function (p, i) {
-          var v = p[s.key]; if (v == null || v <= 0) return;
-          var y = Y(v), hh = Math.max(1.5, m.t + ph - y);
-          el('rect', { x: X(i + .5) - bw / 2, y: m.t + ph - hh, width: bw, height: hh, rx: Math.min(2, bw / 2), fill: col }, svg);
-        });
-        return;
-      }
-      var d = '', open = false;
-      D.points.forEach(function (p, i) {
-        var v = p[s.key];
-        if (v == null) { open = false; return; }
-        d += (open ? 'L' : 'M') + X(i + .5).toFixed(1) + ' ' + Y(v).toFixed(1);
-        open = true;
-        var prev = i > 0 ? D.points[i - 1][s.key] : null, next = i < N - 1 ? D.points[i + 1][s.key] : null;
-        if (prev == null && next == null) el('circle', { cx: X(i + .5), cy: Y(v), r: 2.5, fill: col }, svg);
+    if (opt.bars) {
+      var bw = Math.max(1, pw / N - (pw / N > 4 ? 1 : 0));
+      pts.forEach(function (p, i) {
+        if (p.o) el("rect", { x: X(i), y: m.t, width: Math.max(2, pw / N), height: ph,
+          fill: "var(--bad)", opacity: .22 }, svg);
+        if (p.v == null || p.v <= 0) return;
+        el("rect", { x: X(i), y: Y(p.v), width: bw, height: Y(0) - Y(p.v),
+          fill: p.o ? "var(--bad)" : "var(--s1)" }, svg);
       });
-      el('path', { d: d, fill: 'none', stroke: col, 'stroke-width': 2, 'stroke-linejoin': 'round', 'stroke-linecap': 'round' }, svg);
-    });
-
-    var hair = el('line', { y1: m.t, y2: m.t + ph, stroke: 'var(--muted)', 'stroke-width': 1, visibility: 'hidden' }, svg);
-    var hit = el('rect', { x: m.l, y: m.t, width: pw, height: ph, fill: 'transparent' }, svg);
-    function move(evt) {
-      var r = svg.getBoundingClientRect(), sx = W / r.width;
-      var i = Math.floor(((evt.clientX - r.left) * sx - m.l) / pw * N);
-      if (i < 0 || i >= N) return leave();
-      var p = D.points[i], x = X(i + .5);
-      hair.setAttribute('x1', x); hair.setAttribute('x2', x); hair.setAttribute('visibility', 'visible');
-      var tip = o.tip; tip.textContent = '';
-      h('div', 't', p.label, tip);
-      if (!p.n) { h('div', null, UI[lang].noData, tip); }
-      else {
-        c.series.forEach(function (s) {
-          var row = h('div', 'r', null, tip), sw = h('i', null, null, row);
-          sw.style.background = 'var(--s' + s.c + ')';
-          h('b', null, fmt(p[s.key], T(c.unit)), row);
-          row.appendChild(document.createTextNode(T(s.name)));
+    } else {
+      opt.keys.forEach(function (k, j) {
+        var d = "", open = false;
+        pts.forEach(function (p, i) {
+          if (p[k] == null) { open = false; return; }
+          d += (open ? "L" : "M") + (X(i + .5)).toFixed(1) + " " + Y(p[k]).toFixed(1); open = true;
         });
-        h('div', 'n', UI[lang].n + p.n, tip);
-      }
-      tip.style.display = 'block';
-      var cr = o.card.getBoundingClientRect(), px = r.left - cr.left + x / sx;
-      var left = px + 12;
-      if (left + tip.offsetWidth > cr.width - 8) left = px - tip.offsetWidth - 12;
-      tip.style.left = Math.max(4, left) + 'px';
-      tip.style.top = (r.top - cr.top + 8) + 'px';
+        el("path", { d: d, fill: "none", stroke: j ? "var(--s2)" : "var(--s1)",
+          "stroke-width": 2, "stroke-linejoin": "round" }, svg);
+      });
     }
-    function leave() { hair.setAttribute('visibility', 'hidden'); o.tip.style.display = 'none'; }
-    hit.addEventListener('pointermove', move);
-    hit.addEventListener('pointerleave', leave);
+    var hair = el("line", { y1: m.t, y2: m.t + ph, stroke: "var(--muted)", visibility: "hidden" }, svg);
+    var hit = el("rect", { x: m.l, y: m.t, width: pw, height: ph, fill: "transparent" }, svg);
+    hit.addEventListener("pointermove", function (ev) {
+      var r = svg.getBoundingClientRect(), sx = W / r.width;
+      var i = Math.floor(((ev.clientX - r.left) * sx - m.l) / pw * N);
+      if (i < 0 || i >= N) return;
+      var p = pts[i], x = X(i + .5);
+      hair.setAttribute("x1", x); hair.setAttribute("x2", x); hair.setAttribute("visibility", "visible");
+      tip.innerHTML = "";
+      var t = document.createElement("div"); t.className = "t"; t.textContent = p.l; tip.appendChild(t);
+      opt.rows(p).forEach(function (s) { var d = document.createElement("div"); d.textContent = s; tip.appendChild(d); });
+      tip.style.display = "block";
+      var cr = sec.getBoundingClientRect(), px = r.left - cr.left + x / sx, left = px + 12;
+      if (left + tip.offsetWidth > cr.width - 8) left = px - tip.offsetWidth - 12;
+      tip.style.left = Math.max(4, left) + "px";
+      tip.style.top = (box.getBoundingClientRect().top - cr.top) + "px";
+    });
+    hit.addEventListener("pointerleave", function () { hair.setAttribute("visibility", "hidden"); tip.style.display = "none"; });
   }
-  function drawAll() { cards.forEach(draw); }
-  renderAll();
-  var tm; window.addEventListener('resize', function () { clearTimeout(tm); tm = setTimeout(drawAll, 120); });
+  function f(v) { return v == null ? "—" : (Math.round(v * 10) / 10) + "%"; }
+  function part(id, P) {
+    var s = document.getElementById(id), h = s.querySelector("h2"), ul = s.querySelector("ul");
+    var bad = /нестабильно|неправильно|внимания|qeyri-sabit|diqqət/.test(P.head.ru + P.head.az);
+    h.className = bad ? "bad" : "ok"; h.innerHTML = "<i></i>";
+    h.appendChild(document.createTextNode(P.head[lang]));
+    ul.textContent = "";
+    P.lines.forEach(function (ln) { var li = document.createElement("li"); li.textContent = ln[lang]; ul.appendChild(li); });
+  }
+  function draw() {
+    var U = UI[lang];
+    chart(document.getElementById("net"), D.netPts, { h: 220, bars: true, keys: ["v"], floor: 1,
+      rows: function (p) {
+        if (p.v == null && p.e == null) return [U.noData];
+        var r = D.rdns ? [U.errLeg + ": " + f(p.v), U.bad + ": " + f(p.e)] : [U.errLeg2 + ": " + f(p.e)];
+        return r.concat(p.o ? [U.outLeg] : []); } });
+    chart(document.getElementById("srv"), D.srvPts, { h: 180, keys: ["a", "b"], floor: 20,
+      rows: function (p) { return p.a == null ? [U.noData] : [U.cpu + ": " + f(p.a), U.mem + ": " + f(p.b)]; } });
+  }
+  function render() {
+    document.documentElement.lang = lang;
+    document.getElementById("period").textContent = D.period[lang];
+    part("net", D.net); part("srv", D.srv);
+    document.querySelectorAll("[data-t]").forEach(function (e) {
+      var k = e.getAttribute("data-t"); if (k === "errLeg" && !D.rdns) k = "errLeg2";
+      e.textContent = UI[lang][k]; });
+    document.querySelectorAll(".langs button").forEach(function (b) {
+      b.setAttribute("aria-pressed", b.getAttribute("data-lang") === lang ? "true" : "false"); });
+    draw();
+  }
+  document.querySelectorAll(".langs button").forEach(function (b) {
+    b.addEventListener("click", function () { lang = b.getAttribute("data-lang");
+      try { localStorage.setItem("netdiag-lang", lang); } catch (e) {} render(); });
+  });
+  render();
+  var tm; window.addEventListener("resize", function () { clearTimeout(tm); tm = setTimeout(draw, 120); });
 })();
 </script>
 </body>
@@ -3239,15 +2932,23 @@ def build_report(since=None, until=None):
         except Exception as e:             # журналы сервера не должны ломать отчёт
             A.security = None
             log.warning("security summary failed: %s", e)
-    txt = render(A) if A.first is not None else "Отчёт пуст: нет данных.\n"
+    if A.first is None:
+        txt = "Отчёт пуст: нет данных.\n"
+        with open(OUT_REPORT, "w", encoding="utf-8") as f:
+            f.write(txt)
+        return txt
+    full = render(A)                       # подробный: для разбора, не для руководства
+    with open(OUT_FULL, "w", encoding="utf-8") as f:
+        f.write(full)
+    B = brief(A)
+    txt = render_brief(A, B)
     with open(OUT_REPORT, "w", encoding="utf-8") as f:
         f.write(txt)
-    if A.first is not None:
-        try:
-            with open(OUT_HTML, "w", encoding="utf-8") as f:
-                f.write(render_html(A, txt))
-        except Exception as e:                 # графики не должны ломать отчёт
-            log.warning("html report failed: %s", e)
+    try:
+        with open(OUT_HTML, "w", encoding="utf-8") as f:
+            f.write(render_html(A, B))
+    except Exception as e:                     # графики не должны ломать отчёт
+        log.warning("html report failed: %s", e)
     log.info("report written: %s", OUT_REPORT)
     return txt
 

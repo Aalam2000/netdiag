@@ -157,7 +157,7 @@ main() {
         echo "[*] Строю отчёт и останавливаю..."
         docker compose exec -T netdiag python /app/netdiag.py report > /dev/null || true
         docker compose stop
-        echo "[*] Отчёт готов: ./data/report.txt и ./data/report.html (графики)"
+        echo "[*] Отчёт готов: ./data/report.html, подробно — ./data/report-full.txt"
         ;;
 
       restart)
@@ -184,7 +184,8 @@ main() {
         echo "[*] Строю отчёт по накопленным данным..."
         shift
         docker compose exec -T netdiag python /app/netdiag.py report "$@"
-        echo "[*] Графики: $PROJECT_DIR/data/report.html — скопируй и открой в браузере"
+        echo "[*] Для руководства: $PROJECT_DIR/data/report.html (открыть в браузере)"
+        echo "[*] Подробно: $PROJECT_DIR/data/report-full.txt"
         ;;
 
       down)
