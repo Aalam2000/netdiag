@@ -1190,7 +1190,8 @@ def _stat():
             "cpu_sum": 0.0, "mem_sum": 0.0, "sys_n": 0,      # сервер
             "cpu_max": 0.0, "mem_max": 0.0,
             "bc_n": 0, "bc_sec": 0.0, "bc_max": 0.0,         # широковещательные
-            "dev_sum": 0, "dev_n": 0, "dev_max": 0, "outages": 0}
+            "dev_sum": 0, "dev_n": 0, "dev_max": 0, "outages": 0,
+            "tot_sum": 0, "tot_n": 0, "tot_max": 0}    # все устройства, с постоянными
 
 
 def bucket_of(dev):
@@ -1297,6 +1298,11 @@ class Analyzer:
         if u:
             self._upnp(ts, u, spots)
         devs = rec.get("devs")
+        if devs:                           # полная нагрузка: все ответившие устройства
+            for s in spots:
+                s["tot_sum"] += len(devs)
+                s["tot_n"] += 1
+                s["tot_max"] = max(s["tot_max"], len(devs))
         if devs and USE_DEVICE_COUNT:
             self._devs(ts, devs, spots)
 
@@ -2363,9 +2369,10 @@ def _merge(stats):
                   "ctl_try", "ctl_lost", "dev_sum", "dev_n",
                   "join", "left", "scans", "rx_bits", "tx_bits", "tr_sec",
                   "b_n", "b_lost", "cpu_sum", "mem_sum", "sys_n",
-                  "bc_n", "bc_sec"):
+                  "bc_n", "bc_sec", "tot_sum", "tot_n"):
             m[k] += s[k]
         m["bc_max"] = max(m["bc_max"], s["bc_max"])
+        m["tot_max"] = max(m["tot_max"], s["tot_max"])
         for k in ("rtt", "ext", "b_p50", "b_max"):
             m[k].extend(s[k])
     return m
@@ -2406,6 +2413,8 @@ def build_timeline(A):
             "rm": _r(quantile(m["rtt"], 0.5), 1), "r95": _r(quantile(m["rtt"], 0.95), 1),
             "em": _r(quantile(m["ext"], 0.5), 1), "e95": _r(quantile(m["ext"], 0.95), 1),
             "dev": _r(m["dev_sum"] / m["dev_n"], 1) if m["dev_n"] else None,
+            "tot": _r(m["tot_sum"] / m["tot_n"], 1) if m["tot_n"] else None,
+            "totmax": m["tot_max"] if m["tot_n"] else None,
             "join": _r(m["join"] / m["scans"], 2) if m["scans"] else None,
             "left": _r(m["left"] / m["scans"], 2) if m["scans"] else None,
             "rx": _r(m["rx_bits"] / m["tr_sec"] / 1e6, 2) if m["tr_sec"] else None,
@@ -2643,12 +2652,15 @@ def render_html(A, B):
                if p["n"] else {"l": p["label"]} for p in points]
     srv_pts = [{"l": p["label"], "a": p.get("cpu"), "b": p.get("mem")}
                if p["n"] else {"l": p["label"]} for p in points]
+    dev_pts = [{"l": p["label"], "a": p.get("tot"), "b": p.get("totmax")}
+               if p["n"] else {"l": p["label"]} for p in points]
     data = {
         "period": {"ru": f"{A.first:%d.%m.%y %H:%M} — {A.last:%d.%m.%y %H:%M}",
                    "az": f"{A.first:%d.%m.%y %H:%M} — {A.last:%d.%m.%y %H:%M}"},
         "net": B["net"], "srv": B["srv"], "ticks": ticks, "rdns": A.has_rdns,
         "netPts": net_pts,
         "srvPts": srv_pts if A.total["sys_n"] else None,
+        "devPts": dev_pts if A.total["tot_n"] else None,
     }
     blob = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
     return HTML_TEMPLATE.replace("__DATA__", blob)
@@ -2722,6 +2734,10 @@ svg.chart text { fill: var(--muted); font-size: 11px; font-variant-numeric: tabu
     <div class="legend"><span><i style="background:var(--s1)"></i><b data-t="errLeg"></b></span>
       <span><i style="background:var(--bad)"></i><b data-t="outLeg"></b></span></div>
     <div class="plot"></div><div class="tip"></div></section>
+  <section id="dev"><h2 data-t="devTitle"></h2>
+    <div class="legend"><span><i style="background:var(--s1)"></i><b data-t="devAvg"></b></span>
+      <span><i style="background:var(--s2)"></i><b data-t="devMax"></b></span></div>
+    <div class="plot"></div><div class="tip"></div></section>
   <section id="srv"><h2></h2><ul></ul>
     <div class="legend"><span><i style="background:var(--s1)"></i><b data-t="cpu"></b></span>
       <span><i style="background:var(--s2)"></i><b data-t="mem"></b></span></div>
@@ -2735,10 +2751,14 @@ svg.chart text { fill: var(--muted); font-size: 11px; font-variant-numeric: tabu
     ru: { errLeg: "Роутер не ответил, % запросов", errLeg2: "Ошибки, % замеров",
           bad: "Замеров с ошибками", outLeg: "Интернет пропадал",
           cpu: "Процессор, %", mem: "Память, %", noData: "нет данных",
+          devTitle: "Устройств в сети — всего, включая постоянные",
+          devAvg: "В среднем", devMax: "Максимум",
           foot: "Подробный технический отчёт" },
     az: { errLeg: "Router cavab vermədi, sorğuların %-i", errLeg2: "Səhvlər, ölçmələrin %-i",
           bad: "Səhvli ölçmələr", outLeg: "İnternet itib",
           cpu: "Prosessor, %", mem: "Yaddaş, %", noData: "məlumat yoxdur",
+          devTitle: "Şəbəkədəki cihazlar — hamısı, daimi olanlar daxil",
+          devAvg: "Orta", devMax: "Maksimum",
           foot: "Ətraflı texniki hesabat" }
   };
   var lang = "ru";
@@ -2828,6 +2848,11 @@ svg.chart text { fill: var(--muted); font-size: 11px; font-variant-numeric: tabu
         if (p.v == null && p.e == null) return [U.noData];
         var r = D.rdns ? [U.errLeg + ": " + f(p.v), U.bad + ": " + f(p.e)] : [U.errLeg2 + ": " + f(p.e)];
         return r.concat(p.o ? [U.outLeg] : []); } });
+    var ds = document.getElementById("dev");
+    ds.style.display = D.devPts ? "" : "none";
+    if (D.devPts) chart(ds, D.devPts, { h: 200, keys: ["a", "b"], floor: 10,
+      rows: function (p) { return p.a == null ? [U.noData]
+        : [U.devAvg + ": " + Math.round(p.a), U.devMax + ": " + p.b]; } });
     chart(document.getElementById("srv"), D.srvPts, { h: 180, keys: ["a", "b"], floor: 20,
       rows: function (p) { return p.a == null ? [U.noData] : [U.cpu + ": " + f(p.a), U.mem + ": " + f(p.b)]; } });
   }
