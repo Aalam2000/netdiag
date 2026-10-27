@@ -57,16 +57,18 @@ LAN_NET = "192.168.0.0/24"       # локальная сеть (для подс�
 # сервер видит все устройства. Отчёт сравнивает «до» и «после».
 REBUILD_AT = "2026-10-24T00:00:00"
 
-# Отрезки, исключённые из отчёта как ошибка замера: с указанного момента
-# и до тех пор, пока роутер снова не ответит на 80-й порт (+EXCLUDE_TAIL_SEC).
-EXCLUDE_UNTIL_ROUTER_OK = [
+# Отрезки, где была испорчена только проверка веб-портов роутера (gw_80,
+# gw_443): с указанного момента и пока роутер снова не ответит на 80-й порт.
+# Остальные данные (DNS роутера, интернет, устройства, сервер) учитываются.
+# Замеры, где при этом пропал весь интернет, — плановая перезагрузка роутера,
+# снявшая сбой: они не считаются обрывом.
+ROUTER_WEB_INVALID = [
     ("2026-10-23T22:58:00",
-     {"ru": "ошибка замера: после проверки роутер заблокировал сервер; сюда же "
-            "попала плановая перезагрузка роутера, снявшая блокировку",
-      "az": "ölçmə xətası: yoxlamadan sonra router serveri blokladı; buraya "
-            "bloku aradan qaldıran planlı router yenidən başladılması da daxildir"}),
+     {"ru": "после проверки с сервера у роутера зависла служба "
+            "веб-интерфейса; сеть и DNS роутера при этом работали",
+      "az": "serverdən yoxlamadan sonra routerin veb-interfeys xidməti "
+            "donub; şəbəkə və routerin DNS-i isə işləyirdi"}),
 ]
-EXCLUDE_TAIL_SEC = 180
 
 # (имя, тип, хост, порт). Имена gw_* — роутер, остальные — внешние ресурсы.
 LOCAL_TARGETS = [
@@ -1830,9 +1832,12 @@ def render(A):
     L.append("")
 
     if getattr(A, "excluded", None):
-        L.append("ИСКЛЮЧЕНО ИЗ ОТЧЁТА (ошибка замера, данные не учитываются)")
+        L.append("ОШИБКИ ЗАМЕРА (не учитывается только проверка веб-портов роутера)")
         for st, en, why in A.excluded:
             L.append(f"  с {fmt_dt(st)} по {fmt_dt(en)}: {why['ru']}")
+        for m0, m1 in getattr(A, "maint", None) or []:
+            L.append(f"  перезагрузка роутера вручную {fmt_dt(m0)} — {fmt_dt(m1)}: "
+                     "плановое обслуживание, исключена из отчёта")
         L.append("")
 
     if A.gaps:
@@ -2589,8 +2594,19 @@ def brief(A):
 
     for st, en, why in getattr(A, "excluded", None) or []:
         net.append({
-            "ru": f"Из отчёта исключён отрезок {st:%d.%m %H:%M} — {en:%d.%m %H:%M}: {why['ru']}.",
-            "az": f"{st:%d.%m %H:%M} — {en:%d.%m %H:%M} aralığı hesabatdan çıxarılıb: {why['az']}."})
+            "ru": f"С {st:%d.%m %H:%M} по {en:%d.%m %H:%M} не учитывается только проверка "
+                  f"веб-интерфейса роутера: {why['ru']}. Остальные данные за это время "
+                  "в отчёте.",
+            "az": f"{st:%d.%m %H:%M} — {en:%d.%m %H:%M} aralığında yalnız routerin "
+                  f"veb-interfeys yoxlaması nəzərə alınmır: {why['az']}. Bu müddətin "
+                  "qalan məlumatları hesabatdadır."})
+    for m0, m1 in getattr(A, "maint", None) or []:
+        sec = (m1 - m0).total_seconds() + INTERVAL_SEC
+        net.append({
+            "ru": f"{m0:%d.%m в %H:%M} роутер перезагружали вручную ({fmt_dur(sec)}) — "
+                  "плановое обслуживание, обрывом не считается.",
+            "az": f"{m0:%d.%m, saat %H:%M} router əl ilə yenidən başladılıb "
+                  f"({fmt_dur(sec, 'az')}) — planlı xidmət, kəsinti sayılmır."})
 
     # 2. зависимость от нагрузки
     work, off = _day_night(A)
@@ -3030,8 +3046,8 @@ def build_report(since=None, until=None):
     A.n_const = len(const) if const is not None else None
     people = None                          # видимых устройств людей
     excl = [{"from": datetime.fromisoformat(f).replace(tzinfo=TZ), "why": why,
-             "end": None, "first": None, "last": None}
-            for f, why in EXCLUDE_UNTIL_ROUTER_OK]
+             "end": None, "first": None, "last": None, "m0": None, "m1": None}
+            for f, why in ROUTER_WEB_INVALID]
     reb = _rebuild()
     cmp_ = {k: {"n": 0, "dns_n": 0, "lost": 0, "dev": [], "days": set()}
             for k in ("before", "after")}
@@ -3058,14 +3074,21 @@ def build_report(since=None, until=None):
                 if (since and ts < since) or (until and ts >= until):
                     continue
                 cut = False
-                for e in excl:                 # отрезки с ошибкой замера
-                    if ts < e["from"] or (e["end"] is not None and ts > e["end"]):
+                for e in excl:                 # испорчена только проверка веб-портов
+                    if ts < e["from"] or e["end"] is not None:
                         continue
-                    if e["end"] is None and (data.get("gw_80") or {}).get("ok"):
-                        e["end"] = ts + timedelta(seconds=EXCLUDE_TAIL_SEC)
+                    if (data.get("gw_80") or {}).get("ok"):
+                        e["end"] = ts          # роутер снова отвечает — конец
+                        continue
                     e["first"] = e["first"] or ts
                     e["last"] = ts
-                    cut = True
+                    data = {k: v for k, v in data.items()
+                            if k not in ("gw_80", "gw_443")}
+                    ext = [v for k, v in data.items() if not k.startswith(("gw_", "ctl_"))]
+                    if ext and not any(v.get("ok") for v in ext):
+                        e["m0"] = e["m0"] or ts    # перезагрузка роутера
+                        e["m1"] = ts
+                        cut = True
                 if cut:
                     skipped = True
                     continue
@@ -3093,6 +3116,7 @@ def build_report(since=None, until=None):
                 A.feed(ts, data, dev, r)
     A.finish()
     A.excluded = [(e["first"], e["last"], e["why"]) for e in excl if e["first"]]
+    A.maint = [(e["m0"], e["m1"]) for e in excl if e["m0"]]
     A.compare = cmp_
     if A.first is not None:
         try:
