@@ -50,8 +50,23 @@ GATEWAY = "192.168.0.1"          # главный роутер
 #  - дополнительный роутер раздаёт свою подсеть (двойной NAT), устройства за
 #    ним серверу не видны.
 CLIENTS_USE_ROUTER_DNS = False
-HIDDEN_SUBNETS = ["192.168.1.0/24"]
+HIDDEN_SUBNETS = ["192.168.1.0/24"]  # так было ДО перестройки сети (REBUILD_AT)
 LAN_NET = "192.168.0.0/24"       # локальная сеть (для подсчёта устройств)
+
+# Перестройка сети: с этого момента вложенных роутеров нет, одна сеть,
+# сервер видит все устройства. Отчёт сравнивает «до» и «после».
+REBUILD_AT = "2026-10-24T00:00:00"
+
+# Отрезки, исключённые из отчёта как ошибка замера: с указанного момента
+# и до тех пор, пока роутер снова не ответит на 80-й порт (+EXCLUDE_TAIL_SEC).
+EXCLUDE_UNTIL_ROUTER_OK = [
+    ("2026-10-23T22:58:00",
+     {"ru": "ошибка замера: после проверки роутер заблокировал сервер; сюда же "
+            "попала плановая перезагрузка роутера, снявшая блокировку",
+      "az": "ölçmə xətası: yoxlamadan sonra router serveri blokladı; buraya "
+            "bloku aradan qaldıran planlı router yenidən başladılması da daxildir"}),
+]
+EXCLUDE_TAIL_SEC = 180
 
 # (имя, тип, хост, порт). Имена gw_* — роутер, остальные — внешние ресурсы.
 LOCAL_TARGETS = [
@@ -1527,6 +1542,21 @@ def both(fn):
     return {"ru": fn("ru"), "az": fn("az")}
 
 
+def _rebuild():
+    return datetime.fromisoformat(REBUILD_AT).replace(tzinfo=TZ) if REBUILD_AT else None
+
+
+def _hidden_before(A):
+    """Были ли в периоде отчёта вложенные сети (до перестройки)."""
+    r = _rebuild()
+    return bool(HIDDEN_SUBNETS) and A.first is not None and (r is None or A.first < r)
+
+
+def _rebuilt_in(A):
+    r = _rebuild()
+    return r is not None and A.last is not None and A.last >= r
+
+
 def plural(n, one, few, many):
     n10, n100 = n % 10, n % 100
     if n10 == 1 and n100 != 11:
@@ -1785,7 +1815,9 @@ def render(A):
                   f"роутеры, камеры — отвечают почти всегда): {A.n_const}; они из "
                   "подсчёта исключены. «Устр. людей» в таблицах — устройства "
                   "людей, видимые в этой сети.", 76, "  ", "  ")
-        if HIDDEN_SUBNETS:
+        if _hidden_before(A):
+            if _rebuilt_in(A):
+                L += wrap(f"До перестройки сети {_rebuild():%d.%m}:", 76, "  ", "  ")
             L += wrap(f"ВАЖНО: большинство устройств людей подключено через "
                       f"вложенные роутеры (подсеть {', '.join(HIDDEN_SUBNETS)}) и "
                       "серверу не видно — каждый такой роутер виден как одно "
@@ -1796,6 +1828,12 @@ def render(A):
         L.append("  Числа устройств в этих данных нет — нагрузка оценивается по")
         L.append("  времени суток.")
     L.append("")
+
+    if getattr(A, "excluded", None):
+        L.append("ИСКЛЮЧЕНО ИЗ ОТЧЁТА (ошибка замера, данные не учитываются)")
+        for st, en, why in A.excluded:
+            L.append(f"  с {fmt_dt(st)} по {fmt_dt(en)}: {why['ru']}")
+        L.append("")
 
     if A.gaps:
         L.append("ПЕРЕРЫВЫ В НАБЛЮДЕНИИ (сервер не работал, сбоями не считаются)")
@@ -2320,8 +2358,9 @@ def render(A):
     L.append("ЧЕГО ЭТОТ ОТЧЁТ НЕ ПОКАЗЫВАЕТ")
     L += wrap("- Качество Wi-Fi по комнатам: сервер подключён проводом. Для этого "
               "нужен такой же замер с устройства, подключённого по Wi-Fi.", 76, "  ", "    ")
-    if HIDDEN_SUBNETS:
-        L += wrap(f"- Устройства и сбои за дополнительным роутером (подсеть "
+    if _hidden_before(A):
+        L += wrap("- " + ("До перестройки сети: у" if _rebuilt_in(A) else "У")
+                  + f"стройства и сбои за дополнительным роутером (подсеть "
                   f"{', '.join(HIDDEN_SUBNETS)}): сервер стоит в основной сети и "
                   "видит только её.", 76, "  ", "    ")
     L += wrap(f"- Замирания короче {INTERVAL_SEC} секунд между сериями быстрых проб.",
@@ -2477,6 +2516,41 @@ def _day_night(A):
     return work, off
 
 
+def compare_line(A):
+    """Сравнение часов занятий до и после перестройки сети."""
+    C = getattr(A, "compare", None)
+    if not C:
+        return None
+    b, a = C["before"], C["after"]
+    if b["n"] < 720 or a["n"] < 720 or not b["dns_n"] or not a["dns_n"]:
+        return None
+    d = f"{_rebuild():%d.%m}"
+    pb, pa = pct(b["lost"], b["dns_n"]), pct(a["lost"], a["dns_n"])
+    days = len(a["days"])
+    ru = (f"После перестройки (с {d}, {plural(days, 'день', 'дня', 'дней')} с занятиями) "
+          f"в часы занятий роутер не ответил на {pa:.1f}% запросов против {pb:.1f}% до неё")
+    az = (f"Yenidən qurulmadan sonra ({d} tarixindən, dərsli {days} gün) dərs "
+          f"saatlarında router sorğuların {pa:.1f}%-nə cavab verməyib, əvvəl isə {pb:.1f}%")
+    if a["dev"] and b["dev"]:
+        ru += (f"; в пик в сети до {max(a['dev'])} устройств (до перестройки "
+               f"сервер видел до {max(b['dev'])})")
+        az += (f"; pik vaxtı şəbəkədə {max(a['dev'])} cihaza qədər (əvvəl server "
+               f"{max(b['dev'])} cihaza qədər görürdü)")
+    if pa <= pb / 2:
+        ru += ". Сеть стала работать заметно стабильнее, хотя нагрузка теперь видна полностью."
+        az += ". Yük indi tam görünsə də, şəbəkə xeyli sabit işləməyə başlayıb."
+    elif pa >= pb * 1.5:
+        ru += ". Ошибок стало больше: роутер не справляется с полной нагрузкой."
+        az += ". Səhvlər artıb: router tam yükə tab gətirmir."
+    else:
+        ru += ". Заметной разницы пока нет."
+        az += ". Hələlik nəzərəçarpan fərq yoxdur."
+    if days < 3:
+        ru += " Данных после перестройки пока мало — вывод предварительный."
+        az += " Yenidən qurulmadan sonrakı məlumat hələ azdır — nəticə ilkindir."
+    return {"ru": ru, "az": az}
+
+
 def brief(A):
     """Выводы для короткого отчёта: {"net": {...}, "srv": {...}}, каждая
     фраза — {"ru": ..., "az": ...}. Вызывать после render(A)."""
@@ -2512,6 +2586,11 @@ def brief(A):
     else:
         net.append({"ru": "Полностью интернет не пропадал.",
                     "az": "İnternet tamamilə itməyib."})
+
+    for st, en, why in getattr(A, "excluded", None) or []:
+        net.append({
+            "ru": f"Из отчёта исключён отрезок {st:%d.%m %H:%M} — {en:%d.%m %H:%M}: {why['ru']}.",
+            "az": f"{st:%d.%m %H:%M} — {en:%d.%m %H:%M} aralığı hesabatdan çıxarılıb: {why['az']}."})
 
     # 2. зависимость от нагрузки
     work, off = _day_night(A)
@@ -2555,9 +2634,23 @@ def brief(A):
         net.append({"ru": ru, "az": az})
 
     # 4. как собрана сеть
-    if HIDDEN_SUBNETS:
+    nets = ", ".join([_net_x(LAN_NET)] + [_net_x(x) for x in HIDDEN_SUBNETS])
+    if _hidden_before(A) and _rebuilt_in(A):
+        d = f"{_rebuild():%d.%m}"
+        net.append({
+            "ru": f"До {d} сеть была собрана неправильно: под одним Wi-Fi работали "
+                  f"разные сети ({nets}) — роутер стоял за роутером, и большинство "
+                  f"устройств сервер не видел. {d} сеть перестроена: теперь это одна "
+                  "сеть, и сервер видит все устройства.",
+            "az": f"{d} tarixinədək şəbəkə səhv qurulmuşdu: bir Wi-Fi altında müxtəlif "
+                  f"şəbəkələr işləyirdi ({nets}) — router routerin arxasında idi və "
+                  f"server cihazların əksəriyyətini görmürdü. {d} şəbəkə yenidən "
+                  "quruldu: indi bu, vahid şəbəkədir və server bütün cihazları görür."})
+        line = compare_line(A)
+        if line:
+            net.append(line)
+    elif _hidden_before(A):
         bad_net = True
-        nets = ", ".join([_net_x(LAN_NET)] + [_net_x(x) for x in HIDDEN_SUBNETS])
         net.append({
             "ru": "Сеть собрана неправильно: под одним Wi-Fi работают разные "
                   f"сети ({nets}) — роутер стоит за роутером. Поэтому в разных "
@@ -2936,6 +3029,13 @@ def build_report(since=None, until=None):
     const = constant_devices(since, until) if USE_DEVICE_COUNT else None
     A.n_const = len(const) if const is not None else None
     people = None                          # видимых устройств людей
+    excl = [{"from": datetime.fromisoformat(f).replace(tzinfo=TZ), "why": why,
+             "end": None, "first": None, "last": None}
+            for f, why in EXCLUDE_UNTIL_ROUTER_OK]
+    reb = _rebuild()
+    cmp_ = {k: {"n": 0, "dns_n": 0, "lost": 0, "dev": [], "days": set()}
+            for k in ("before", "after")}
+    skipped = False
     for d, path in data_files():
         try:                               # файлы целиком вне периода не читаем
             if d is None:
@@ -2957,7 +3057,32 @@ def build_report(since=None, until=None):
                     continue
                 if (since and ts < since) or (until and ts >= until):
                     continue
+                cut = False
+                for e in excl:                 # отрезки с ошибкой замера
+                    if ts < e["from"] or (e["end"] is not None and ts > e["end"]):
+                        continue
+                    if e["end"] is None and (data.get("gw_80") or {}).get("ok"):
+                        e["end"] = ts + timedelta(seconds=EXCLUDE_TAIL_SEC)
+                    e["first"] = e["first"] or ts
+                    e["last"] = ts
+                    cut = True
+                if cut:
+                    skipped = True
+                    continue
+                if skipped:                    # не считать вырезанное перерывом
+                    A.prev = None
+                    skipped = False
                 devs = r.get("devs")
+                if reb is not None and WORK_HOURS[0] <= ts.hour < WORK_HOURS[1]:
+                    c = cmp_["after" if ts >= reb else "before"]
+                    c["n"] += 1
+                    c["days"].add(ts.date())
+                    g = data.get("gw_dns")
+                    if g is not None:
+                        c["dns_n"] += 1
+                        c["lost"] += 0 if g.get("ok") else 1
+                    if devs:
+                        c["dev"].append(len(devs))
                 if devs:
                     for ip, mac in devs.items():
                         A.mac_ip[mac] = ip
@@ -2967,6 +3092,8 @@ def build_report(since=None, until=None):
                        else None)
                 A.feed(ts, data, dev, r)
     A.finish()
+    A.excluded = [(e["first"], e["last"], e["why"]) for e in excl if e["first"]]
+    A.compare = cmp_
     if A.first is not None:
         try:
             A.security = security_summary(A.first, A.last)
