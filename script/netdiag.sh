@@ -146,6 +146,7 @@ main() {
         echo "[*] Отчёт: http://$(hostname -I | awk '{print $1}'):8090/ (обновляется раз в час)"
         [ -n "$OLD" ] && [ "$OLD" != "$NEW" ] && echo "[*] Была: $OLD"
         echo "[*] Данные в ./data сохранены."
+        [ -e /etc/bash_completion.d/netdiag ] || echo "[i] Подсказки по Tab не подключены: sudo ln -s $SCRIPT_DIR/netdiag-completion.bash /etc/bash_completion.d/netdiag"
         ;;
 
       start)

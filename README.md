@@ -212,7 +212,8 @@ to any port 8090 proto tcp`). Порт 8090 снаружи закрыт файр
     │   ├── report.txt        # сгенерированный отчёт
     │   └── report.html       # он же с графиками по времени
     └── script/
-        └── netdiag.sh        # управление: start/stop/report/...
+        ├── netdiag.sh        # управление: start/stop/report/...
+        └── netdiag-completion.bash  # подсказки по Tab
 
 ## Установка (один раз)
 
@@ -221,6 +222,11 @@ to any port 8090 proto tcp`). Порт 8090 снаружи закрыт файр
     sudo systemctl enable docker
     docker compose up -d --build
     sudo ln -s /opt/netdiag/script/netdiag.sh /usr/local/bin/netdiag
+    sudo ln -s /opt/netdiag/script/netdiag-completion.bash /etc/bash_completion.d/netdiag
+
+Последняя строка включает подсказки по Tab: команды, `--force` у deploy,
+ключи report и даты, за которые есть данные. Действует в новых окнах
+терминала (или сразу после `source /etc/bash_completion.d/netdiag`).
 
 ## Обновление на сервере
 
