@@ -57,52 +57,25 @@ LAN_NET = "192.168.0.0/24"       # локальная сеть (для подс�
 # сервер видит все устройства. Отчёт сравнивает «до» и «после».
 REBUILD_AT = "2026-10-24T00:00:00"
 
-# Заключение для руководства: показывается первым блоком отчёта (RU/AZ).
-# Текст ручной, обновлять при изменении картины; None — блок скрыт.
-SUMMARY = {
-    "head": {"ru": "Состояние сети на 03.11.2026: стабильно",
-             "az": "Şəbəkənin vəziyyəti 03.11.2026 tarixinə: sabit"},
-    "lines": [
-        {"ru": "23–24.10 сеть перестроена: вместо трёх параллельных сетей под "
-               "одним Wi-Fi теперь одна, точки доступа переведены в правильный режим.",
-         "az": "23–24.10 şəbəkə yenidən quruldu: bir Wi-Fi adı altında işləyən üç "
-               "paralel şəbəkənin əvəzinə indi bir şəbəkədir, giriş nöqtələri düzgün "
-               "rejimə keçirilib."},
-        {"ru": "Обрывов интернета не было. Роутер отвечает за 1,6 мс, в том числе "
-               "в часы пик.",
-         "az": "İnternet kəsintisi olmayıb. Router, pik saatlar da daxil olmaqla, "
-               "1,6 ms-də cavab verir."},
-        {"ru": "Сбои роутера: до перестройки в часы занятий до 5–10% запросов "
-               "оставались без ответа, после — не больше 0,5% в худшие часы.",
-         "az": "Router nasazlıqları: yenidən qurulmadan əvvəl dərs saatlarında "
-               "sorğuların 5–10%-i cavabsız qalırdı, sonra — ən pis saatlarda "
-               "0,5%-dən çox deyil."},
-        {"ru": "Устройств в сети: круглосуточно 20–25 (серверы, камеры, точки "
-               "доступа), в рабочее время 45–50. Максимум — 78 устройств, "
-               "01.11 с 12:00 до 14:00.",
-         "az": "Şəbəkədəki cihazlar: gecə-gündüz 20–25 (serverlər, kameralar, giriş "
-               "nöqtələri), iş vaxtı 45–50. Maksimum — 78 cihaz, 01.11, "
-               "12:00–14:00."},
-        {"ru": "Слабое место — Wi-Fi: устройства долго держатся за дальнюю точку со "
-               "слабым сигналом, переход между точками иногда идёт с обрывом на "
-               "1–2 секунды, нагрузка по точкам распределяется неравномерно.",
-         "az": "Zəif yer — Wi-Fi: cihazlar zəif siqnallı uzaq nöqtədə uzun müddət "
-               "qalır, nöqtələr arasında keçid bəzən 1–2 saniyəlik kəsinti ilə olur, "
-               "yük nöqtələr arasında qeyri-bərabər paylanır."},
-        {"ru": "Причина — разнородные домашние роутеры: в общую систему (mesh) "
-               "объединена одна точка из пяти, точки в Комнате и на Кухне "
-               "ограничены скоростью 90 Мбит/с.",
-         "az": "Səbəb — müxtəlif ev routerləridir: beş nöqtədən yalnız biri ümumi "
-               "sistemə (mesh) qoşulub, Otaq və Mətbəx nöqtələri 90 Mbit/s sürətlə "
-               "məhduddur."},
-        {"ru": "Рекомендация: заменить точку доступа в Зале 2, кабель в Комнате и "
-               "точку на Кухне; для равномерного переключения между точками — точки "
-               "доступа с централизованным управлением (например, MikroTik).",
-         "az": "Tövsiyə: Zal 2-dəki giriş nöqtəsini, Otaqdakı kabeli və Mətbəxdəki "
-               "nöqtəni dəyişmək; nöqtələr arasında bərabər keçid üçün mərkəzləşdirilmiş "
-               "idarəetməli giriş nöqtələri (məsələn, MikroTik)."},
-    ],
-}
+# Короткий вывод в начале отчёта строится сам — по последним RECENT_DAYS суткам.
+RECENT_DAYS = 7
+BAD_HOUR_PCT = 2.0     # час «со сбоем»: роутер не ответил на 2% запросов и больше,
+CTL_OK_PCT = 0.5       # а контрольный DNS 8.8.8.8 при этом почти не терял (< 0,5%)
+
+# Что делали с сетью: показывается в выводе, если дата попала в период отчёта.
+EVENTS = [
+    ("2026-10-24", {"ru": "сеть перестроена: одна сеть вместо трёх, точки доступа "
+                          "переведены в правильный режим",
+                    "az": "şəbəkə yenidən quruldu: üç şəbəkənin əvəzinə bir şəbəkə, "
+                          "giriş nöqtələri düzgün rejimə keçirildi"}),
+]
+# То, что сервер сам не измеряет (Wi-Fi по комнатам), — по обходам с ноутбуком.
+NOTES = [
+    {"ru": "Слабое место — Wi-Fi: устройства долго держатся за дальнюю точку, нагрузка "
+           "по точкам неравномерная. Нужны точки доступа с общим управлением.",
+     "az": "Zəif yer — Wi-Fi: cihazlar uzaq nöqtədə uzun müddət qalır, yük nöqtələr "
+           "arasında qeyri-bərabərdir. Ümumi idarəetməli giriş nöqtələri lazımdır."},
+]
 
 # Отрезки, где была испорчена только проверка веб-портов роутера (gw_80,
 # gw_443): с указанного момента и пока роутер снова не ответит на 80-й порт.
@@ -2603,7 +2576,7 @@ def compare_line(A):
     return {"ru": ru, "az": az}
 
 
-def brief(A):
+def _brief_legacy(A):
     """Выводы для короткого отчёта: {"net": {...}, "srv": {...}}, каждая
     фраза — {"ru": ..., "az": ...}. Вызывать после render(A)."""
     T = A.total
@@ -2785,15 +2758,132 @@ def brief(A):
             "srv": {"head": srv_head, "lines": srv}}
 
 
+def _hours(A):
+    """Почасовая сводка: {наивное местное начало часа: статистика}."""
+    H = {}
+    for k, st in A.tl.items():
+        h = _tl_time(k * TL_STEP_SEC).replace(minute=0, second=0, microsecond=0)
+        H.setdefault(h, []).append(st)
+    return {h: _merge(v) for h, v in sorted(H.items())}
+
+
+def _loss(A, m):
+    if A.has_rdns and m["dns_try"]:
+        return pct(m["dns_lost"], m["dns_try"])
+    return pct(m["bad"], m["n"]) if m["n"] else None
+
+
+def brief(A):
+    """Один короткий вывод о текущем состоянии + подписи к графикам."""
+    H = _hours(A)
+    if not H:
+        return {"sum": None, "cap": {}}
+    first, last = min(H), max(H)
+    recent = last - timedelta(days=RECENT_DAYS)
+    loss = {h: _loss(A, m) for h, m in H.items()}
+    bad = [h for h, m in H.items() if loss[h] is not None and loss[h] >= BAD_HOUR_PCT
+           and (pct(m["ctl_lost"], m["ctl_try"]) if m["ctl_try"] else 0) < CTL_OK_PCT]
+    rbad = [h for h in bad if h >= recent]
+    lines = []
+    if not rbad:
+        ok = True
+        head = {"ru": "Сейчас сеть работает стабильно", "az": "Hazırda şəbəkə sabit işləyir"}
+        if bad:
+            since = (max(bad) + timedelta(days=1)).date()
+            lines.append({"ru": f"С {since:%d.%m} сбоев роутера нет: ни в один час он не терял "
+                                f"{BAD_HOUR_PCT:.0f}% запросов и больше.",
+                          "az": f"{since:%d.%m} tarixindən router nasazlığı yoxdur: heç bir saatda "
+                                f"sorğuların {BAD_HOUR_PCT:.0f}%-ni və daha çoxunu itirməyib."})
+        else:
+            lines.append({"ru": "Сбоев роутера за весь период не было.",
+                          "az": "Bütün dövr ərzində router nasazlığı olmayıb."})
+    else:
+        ok = False
+        lb = max(rbad)
+        n = len(rbad)
+        head = {"ru": "Сейчас есть сбои роутера", "az": "Hazırda router nasazlıqları var"}
+        lines.append({"ru": f"За последние {RECENT_DAYS} дней — {plural(n, 'час', 'часа', 'часов')} "
+                            f"со сбоями, последний {lb:%d.%m в %H:00}: роутер не ответил на "
+                            f"{loss[lb]:.0f}% запросов.",
+                      "az": f"Son {RECENT_DAYS} gündə nasazlıqlı {n} saat olub, sonuncu — "
+                            f"{lb:%d.%m, saat %H:00}: router sorğuların {loss[lb]:.0f}%-nə "
+                            "cavab verməyib."})
+    for d, txt in EVENTS:
+        dt = date.fromisoformat(d)
+        if first.date() <= dt <= last.date():
+            lines.append({"ru": f"{dt:%d.%m} — {txt['ru']}.", "az": f"{dt:%d.%m} — {txt['az']}."})
+    outs = [e for e in A.events if e["kind"] == "outage"]
+    if outs:
+        t = outs[-1]["start"]
+        lines.append({"ru": f"Интернет пропадал {plural(len(outs), 'раз', 'раза', 'раз')}, "
+                            f"последний — {t:%d.%m в %H:%M}.",
+                      "az": f"İnternet {len(outs)} dəfə itib, sonuncu — {t:%d.%m, saat %H:%M}."})
+    else:
+        lines.append({"ru": "Обрывов интернета не было.", "az": "İnternet kəsintisi olmayıb."})
+    lines += NOTES
+
+    cap = {}
+    rl = [(loss[h], h) for h in H if h >= recent and loss[h] is not None]
+    al = [(loss[h], h) for h in H if loss[h] is not None]
+    if rl:
+        wr, hr = max(rl)
+        wa, ha = max(al)
+        if wr == 0:
+            ru = f"Последние {RECENT_DAYS} дней роутер ответил на все запросы."
+            az = f"Son {RECENT_DAYS} gündə router bütün sorğulara cavab verib."
+        else:
+            pct = f"{wr:.0f}" if wr >= 1 else f"{wr:.1f}".replace(".", ",")
+            ru = f"Последние {RECENT_DAYS} дней: худший час — {pct}% ({hr:%d.%m, %H:00})."
+            az = f"Son {RECENT_DAYS} gün: ən pis saat — {pct}% ({hr:%d.%m, %H:00})."
+        if ha < recent and wa >= max(wr * 2, BAD_HOUR_PCT):
+            ru += f" Раньше бывало до {wa:.0f}% ({ha:%d.%m})."
+            az += f" Əvvəl {wa:.0f}%-ə qədər olub ({ha:%d.%m})."
+        cap["net"] = {"ru": ru, "az": az}
+    tot = {h: m for h, m in H.items() if m["tot_n"]}
+    if tot:
+        rec = {h: m for h, m in tot.items() if h >= recent} or tot
+        night = [m["tot_sum"] / m["tot_n"] for h, m in rec.items() if 3 <= h.hour < 5]
+        days = {}
+        for h, m in rec.items():
+            days[h.date()] = max(days.get(h.date(), 0), m["tot_max"])
+        pk, hp = max((m["tot_max"], h) for h, m in tot.items())
+        nt = round(statistics.median(night)) if night else None
+        dm = round(statistics.median(days.values()))
+        h2 = hp + timedelta(hours=1)
+        ru = (f"Круглосуточно около {nt}, днём обычно до {dm}. " if nt else f"Днём обычно до {dm}. ")
+        az = (f"Gecə-gündüz təxminən {nt}, gündüz adətən {dm}-ə qədər. " if nt
+              else f"Gündüz adətən {dm}-ə qədər. ")
+        ru += f"Максимум — {pk} ({hp:%d.%m, %H:00}–{h2:%H:00})."
+        az += f"Maksimum — {pk} ({hp:%d.%m, %H:00}–{h2:%H:00})."
+        cap["dev"] = {"ru": ru, "az": az}
+    T = A.total
+    if T["sys_n"]:
+        cpu, mem = T["cpu_sum"] / T["sys_n"], T["mem_sum"] / T["sys_n"]
+        ru = f"Процессор в среднем {cpu:.0f}%, память {mem:.0f}%."
+        az = f"Prosessor orta hesabla {cpu:.0f}%, yaddaş {mem:.0f}%."
+        SV = getattr(A, "server", None) or server_summary(A)
+        if SV:
+            ru += f" Диск: свободно {fmt_bytes(SV['free'])} из {fmt_bytes(SV['total'])}."
+            az += (f" Disk: {fmt_bytes(SV['total'], 'az')}-dan {fmt_bytes(SV['free'], 'az')} "
+                   "boşdur.")
+        cap["srv"] = {"ru": ru, "az": az}
+    return {"sum": {"head": head, "ok": ok, "lines": lines}, "cap": cap}
+
+
 def render_brief(A, B):
     L = ["ОТЧЁТ NETDIAG",
          f"{A.first:%d.%m.%y %H:%M} — {A.last:%d.%m.%y %H:%M}",
          ""]
-    for part in ("net", "srv"):
-        L.append(B[part]["head"]["ru"].upper())
-        for ln in B[part]["lines"]:
+    if B["sum"]:
+        L.append(B["sum"]["head"]["ru"].upper())
+        for ln in B["sum"]["lines"]:
             L += wrap("• " + ln["ru"], 76, "  ", "    ")
         L.append("")
+    for k, name in (("net", "Ошибки роутера"), ("dev", "Устройства в сети"),
+                    ("srv", "Сервер диагностики")):
+        if B["cap"].get(k):
+            L += wrap(f"{name}: {B['cap'][k]['ru']}", 76, "", "  ")
+    L.append("")
     L.append("Подробный технический отчёт: report-full.txt")
     return "\n".join(L) + "\n"
 
@@ -2813,11 +2903,11 @@ def render_html(A, B):
     data = {
         "period": {"ru": f"{A.first:%d.%m.%y %H:%M} — {A.last:%d.%m.%y %H:%M}",
                    "az": f"{A.first:%d.%m.%y %H:%M} — {A.last:%d.%m.%y %H:%M}"},
-        "net": B["net"], "srv": B["srv"], "ticks": ticks, "rdns": A.has_rdns,
+        "cap": B["cap"], "ticks": ticks, "rdns": A.has_rdns,
         "netPts": net_pts,
         "srvPts": srv_pts if A.total["sys_n"] else None,
         "devPts": dev_pts if A.total["tot_n"] else None,
-        "sum": SUMMARY,
+        "sum": B["sum"],
     }
     blob = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
     return HTML_TEMPLATE.replace("__DATA__", blob)
@@ -2876,6 +2966,7 @@ svg.chart text { fill: var(--muted); font-size: 11px; font-variant-numeric: tabu
 .tip .t { color: var(--text2); }
 .foot { font-size: 12px; } .foot a { color: var(--muted); }
 section.sum { border-width: 2px; }
+.cap { font-size: 13px; color: var(--text2); margin: 4px 0 8px; }
 /* Печать на один лист A4: заключение + графики сети и устройств.
    Автоматические фразы и блок сервера на бумагу не выводятся. */
 @page { size: A4; margin: 12mm; }
@@ -2888,7 +2979,6 @@ section.sum { border-width: 2px; }
   section { break-inside: avoid; padding: 10px 12px 4px; margin-bottom: 8px; }
   h2 { font-size: 14px; margin-bottom: 6px; }
   li { margin: 2px 0; }
-  #net > h2, #net > ul { display: none; }
   #dev h2 { font-size: 12px; }
 }
 </style>
@@ -2904,18 +2994,18 @@ section.sum { border-width: 2px; }
   </div>
   <div class="period" id="period"></div>
   <section id="sum" class="sum"><h2 class="ok"><i></i><span></span></h2><ul></ul></section>
-  <section id="net"><h2></h2><ul></ul>
+  <section id="net"><h2 data-t="netTitle"></h2>
     <div class="legend"><span><i style="background:var(--s1)"></i><b data-t="errLeg"></b></span>
       <span><i style="background:var(--bad)"></i><b data-t="outLeg"></b></span></div>
-    <div class="plot"></div><div class="tip"></div></section>
+    <div class="plot"></div><div class="tip"></div><p class="cap"></p></section>
   <section id="dev"><h2 data-t="devTitle"></h2>
     <div class="legend"><span><i style="background:var(--s1)"></i><b data-t="devAvg"></b></span>
       <span><i style="background:var(--s2)"></i><b data-t="devMax"></b></span></div>
-    <div class="plot"></div><div class="tip"></div></section>
-  <section id="srv"><h2></h2><ul></ul>
+    <div class="plot"></div><div class="tip"></div><p class="cap"></p></section>
+  <section id="srv"><h2 data-t="srvTitle"></h2>
     <div class="legend"><span><i style="background:var(--s1)"></i><b data-t="cpu"></b></span>
       <span><i style="background:var(--s2)"></i><b data-t="mem"></b></span></div>
-    <div class="plot"></div><div class="tip"></div></section>
+    <div class="plot"></div><div class="tip"></div><p class="cap"></p></section>
   <div class="foot"><a href="report-full.txt" target="_blank" data-t="foot"></a></div>
 </main>
 <script>
@@ -2927,12 +3017,14 @@ section.sum { border-width: 2px; }
           cpu: "Процессор, %", mem: "Память, %", noData: "нет данных",
           devTitle: "Устройств в сети — всего, включая постоянные",
           devAvg: "В среднем", devMax: "Максимум",
+          netTitle: "Ошибки роутера", srvTitle: "Сервер диагностики",
           foot: "Подробный технический отчёт" },
     az: { errLeg: "Router cavab vermədi, sorğuların %-i", errLeg2: "Səhvlər, ölçmələrin %-i",
           bad: "Səhvli ölçmələr", outLeg: "İnternet itib",
           cpu: "Prosessor, %", mem: "Yaddaş, %", noData: "məlumat yoxdur",
           devTitle: "Şəbəkədəki cihazlar — hamısı, daimi olanlar daxil",
           devAvg: "Orta", devMax: "Maksimum",
+          netTitle: "Router xətaları", srvTitle: "Diaqnostika serveri",
           foot: "Ətraflı texniki hesabat" }
   };
   var lang = "ru";
@@ -3036,12 +3128,15 @@ section.sum { border-width: 2px; }
     var ss = document.getElementById("sum");
     ss.style.display = D.sum ? "" : "none";
     if (D.sum) {
+      ss.querySelector("h2").className = D.sum.ok ? "ok" : "bad";
       ss.querySelector("h2 span").textContent = D.sum.head[lang];
       var su = ss.querySelector("ul"); su.textContent = "";
       D.sum.lines.forEach(function (ln) { var li = document.createElement("li");
         li.textContent = ln[lang]; su.appendChild(li); });
     }
-    part("net", D.net); part("srv", D.srv);
+    ["net", "dev", "srv"].forEach(function (id) {
+      var c = document.getElementById(id).querySelector(".cap");
+      c.textContent = D.cap[id] ? D.cap[id][lang] : ""; });
     document.querySelectorAll("[data-t]").forEach(function (e) {
       var k = e.getAttribute("data-t"); if (k === "errLeg" && !D.rdns) k = "errLeg2";
       e.textContent = UI[lang][k]; });
