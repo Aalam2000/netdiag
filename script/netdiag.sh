@@ -30,6 +30,7 @@ usage() {
     echo "  report   — построить отчёт (не останавливая мониторинг)"
     echo "             report --since 2026-10-12 --until 2026-10-19 — за период"
     echo "             report --days 30 — за последние 30 суток; --all — за всё время"
+    echo "             report --fast — быстрее: без ограничения процессора"
     echo "  down     — удалить контейнер (данные остаются)"
     echo "  clean    — удалить контейнер и папку data/"
 }
@@ -186,9 +187,22 @@ main() {
         ;;
 
       report)
-        echo "[*] Строю отчёт по накопленным данным..."
         shift
-        docker compose exec -T netdiag-report python /app/netdiag.py report "$@"
+        ARGS=(); FAST=0
+        for A in "$@"; do
+            if [ "$A" = "--fast" ]; then FAST=1; else ARGS+=("$A"); fi
+        done
+        if [ "$FAST" = 1 ]; then
+            # снимаем ограничение процессора на время построения, потом возвращаем
+            OLD_NANO="$(docker inspect -f '{{.HostConfig.NanoCpus}}' netdiag-report)"
+            OLD_CPUS="$(awk -v n="$OLD_NANO" 'BEGIN{printf "%g", n/1e9}')"
+            trap 'docker update --cpus "$OLD_CPUS" netdiag-report >/dev/null' EXIT
+            docker update --cpus "$(nproc)" netdiag-report >/dev/null
+            echo "[*] Строю отчёт без ограничения процессора (потом верну $OLD_CPUS)..."
+        else
+            echo "[*] Строю отчёт по накопленным данным..."
+        fi
+        docker compose exec -T netdiag-report python /app/netdiag.py report "${ARGS[@]}"
         echo "[*] Для руководства: $PROJECT_DIR/data/report.html (открыть в браузере)"
         echo "[*] Подробно: $PROJECT_DIR/data/report-full.txt"
         ;;

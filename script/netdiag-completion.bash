@@ -30,7 +30,7 @@ _netdiag() {
             COMPREPLY=($(compgen -W "1 7 14 30" -- "$cur"))
             ;;
           *)
-            COMPREPLY=($(compgen -W "--since --until --days --all" -- "$cur"))
+            COMPREPLY=($(compgen -W "--fast --since --until --days --all" -- "$cur"))
             ;;
         esac
         ;;

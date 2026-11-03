@@ -135,6 +135,7 @@ to any port 8090 proto tcp`). Порт 8090 снаружи закрыт файр
     netdiag report                 # последние 14 суток
     netdiag report --days 30       # последние 30 суток
     netdiag report --all           # всё, что хранится
+    netdiag report --fast          # быстрее: на время построения снимает лимит процессора
     netdiag report --since 2026-10-12 --until 2026-10-19
 
 ## Что видно кроме обрывов
