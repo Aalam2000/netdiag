@@ -57,6 +57,53 @@ LAN_NET = "192.168.0.0/24"       # локальная сеть (для подс�
 # сервер видит все устройства. Отчёт сравнивает «до» и «после».
 REBUILD_AT = "2026-10-24T00:00:00"
 
+# Заключение для руководства: показывается первым блоком отчёта (RU/AZ).
+# Текст ручной, обновлять при изменении картины; None — блок скрыт.
+SUMMARY = {
+    "head": {"ru": "Состояние сети на 03.11.2026: стабильно",
+             "az": "Şəbəkənin vəziyyəti 03.11.2026 tarixinə: sabit"},
+    "lines": [
+        {"ru": "23–24.10 сеть перестроена: вместо трёх параллельных сетей под "
+               "одним Wi-Fi теперь одна, точки доступа переведены в правильный режим.",
+         "az": "23–24.10 şəbəkə yenidən quruldu: bir Wi-Fi adı altında işləyən üç "
+               "paralel şəbəkənin əvəzinə indi bir şəbəkədir, giriş nöqtələri düzgün "
+               "rejimə keçirilib."},
+        {"ru": "Обрывов интернета не было. Роутер отвечает за 1,6 мс, в том числе "
+               "в часы пик.",
+         "az": "İnternet kəsintisi olmayıb. Router, pik saatlar da daxil olmaqla, "
+               "1,6 ms-də cavab verir."},
+        {"ru": "Сбои роутера: до перестройки в часы занятий до 5–10% запросов "
+               "оставались без ответа, после — не больше 0,5% в худшие часы.",
+         "az": "Router nasazlıqları: yenidən qurulmadan əvvəl dərs saatlarında "
+               "sorğuların 5–10%-i cavabsız qalırdı, sonra — ən pis saatlarda "
+               "0,5%-dən çox deyil."},
+        {"ru": "Устройств в сети: круглосуточно 20–25 (серверы, камеры, точки "
+               "доступа), в рабочее время 45–50. Максимум — 78 устройств, "
+               "01.11 с 12:00 до 14:00.",
+         "az": "Şəbəkədəki cihazlar: gecə-gündüz 20–25 (serverlər, kameralar, giriş "
+               "nöqtələri), iş vaxtı 45–50. Maksimum — 78 cihaz, 01.11, "
+               "12:00–14:00."},
+        {"ru": "Слабое место — Wi-Fi: устройства долго держатся за дальнюю точку со "
+               "слабым сигналом, переход между точками иногда идёт с обрывом на "
+               "1–2 секунды, нагрузка по точкам распределяется неравномерно.",
+         "az": "Zəif yer — Wi-Fi: cihazlar zəif siqnallı uzaq nöqtədə uzun müddət "
+               "qalır, nöqtələr arasında keçid bəzən 1–2 saniyəlik kəsinti ilə olur, "
+               "yük nöqtələr arasında qeyri-bərabər paylanır."},
+        {"ru": "Причина — разнородные домашние роутеры: в общую систему (mesh) "
+               "объединена одна точка из пяти, точки в Комнате и на Кухне "
+               "ограничены скоростью 90 Мбит/с.",
+         "az": "Səbəb — müxtəlif ev routerləridir: beş nöqtədən yalnız biri ümumi "
+               "sistemə (mesh) qoşulub, Otaq və Mətbəx nöqtələri 90 Mbit/s sürətlə "
+               "məhduddur."},
+        {"ru": "Рекомендация: заменить точку доступа в Зале 2, кабель в Комнате и "
+               "точку на Кухне; для равномерного переключения между точками — точки "
+               "доступа с централизованным управлением (например, MikroTik).",
+         "az": "Tövsiyə: Zal 2-dəki giriş nöqtəsini, Otaqdakı kabeli və Mətbəxdəki "
+               "nöqtəni dəyişmək; nöqtələr arasında bərabər keçid üçün mərkəzləşdirilmiş "
+               "idarəetməli giriş nöqtələri (məsələn, MikroTik)."},
+    ],
+}
+
 # Отрезки, где была испорчена только проверка веб-портов роутера (gw_80,
 # gw_443): с указанного момента и пока роутер снова не ответит на 80-й порт.
 # Остальные данные (DNS роутера, интернет, устройства, сервер) учитываются.
@@ -2770,6 +2817,7 @@ def render_html(A, B):
         "netPts": net_pts,
         "srvPts": srv_pts if A.total["sys_n"] else None,
         "devPts": dev_pts if A.total["tot_n"] else None,
+        "sum": SUMMARY,
     }
     blob = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
     return HTML_TEMPLATE.replace("__DATA__", blob)
@@ -2827,6 +2875,9 @@ svg.chart text { fill: var(--muted); font-size: 11px; font-variant-numeric: tabu
   box-shadow: 0 4px 14px rgba(0,0,0,.14); white-space: nowrap; display: none; z-index: 5; }
 .tip .t { color: var(--text2); }
 .foot { font-size: 12px; } .foot a { color: var(--muted); }
+section.sum { border-width: 2px; }
+@media print { .langs, .tip { display: none !important; } body { background: #fff; }
+  section { break-inside: avoid; } }
 </style>
 </head>
 <body>
@@ -2839,6 +2890,7 @@ svg.chart text { fill: var(--muted); font-size: 11px; font-variant-numeric: tabu
     </div>
   </div>
   <div class="period" id="period"></div>
+  <section id="sum" class="sum"><h2 class="ok"><i></i><span></span></h2><ul></ul></section>
   <section id="net"><h2></h2><ul></ul>
     <div class="legend"><span><i style="background:var(--s1)"></i><b data-t="errLeg"></b></span>
       <span><i style="background:var(--bad)"></i><b data-t="outLeg"></b></span></div>
@@ -2968,6 +3020,14 @@ svg.chart text { fill: var(--muted); font-size: 11px; font-variant-numeric: tabu
   function render() {
     document.documentElement.lang = lang;
     document.getElementById("period").textContent = D.period[lang];
+    var ss = document.getElementById("sum");
+    ss.style.display = D.sum ? "" : "none";
+    if (D.sum) {
+      ss.querySelector("h2 span").textContent = D.sum.head[lang];
+      var su = ss.querySelector("ul"); su.textContent = "";
+      D.sum.lines.forEach(function (ln) { var li = document.createElement("li");
+        li.textContent = ln[lang]; su.appendChild(li); });
+    }
     part("net", D.net); part("srv", D.srv);
     document.querySelectorAll("[data-t]").forEach(function (e) {
       var k = e.getAttribute("data-t"); if (k === "errLeg" && !D.rdns) k = "errLeg2";
