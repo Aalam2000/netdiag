@@ -2832,9 +2832,9 @@ def brief(A):
             ru = f"Последние {RECENT_DAYS} дней роутер ответил на все запросы."
             az = f"Son {RECENT_DAYS} gündə router bütün sorğulara cavab verib."
         else:
-            pct = f"{wr:.0f}" if wr >= 1 else f"{wr:.1f}".replace(".", ",")
-            ru = f"Последние {RECENT_DAYS} дней: худший час — {pct}% ({hr:%d.%m, %H:00})."
-            az = f"Son {RECENT_DAYS} gün: ən pis saat — {pct}% ({hr:%d.%m, %H:00})."
+            wr_s = f"{wr:.0f}" if wr >= 1 else f"{wr:.1f}".replace(".", ",")
+            ru = f"Последние {RECENT_DAYS} дней: худший час — {wr_s}% ({hr:%d.%m, %H:00})."
+            az = f"Son {RECENT_DAYS} gün: ən pis saat — {wr_s}% ({hr:%d.%m, %H:00})."
         if ha < recent and wa >= max(wr * 2, BAD_HOUR_PCT):
             ru += f" Раньше бывало до {wa:.0f}% ({ha:%d.%m})."
             az += f" Əvvəl {wa:.0f}%-ə qədər olub ({ha:%d.%m})."
