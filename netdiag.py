@@ -2876,8 +2876,21 @@ svg.chart text { fill: var(--muted); font-size: 11px; font-variant-numeric: tabu
 .tip .t { color: var(--text2); }
 .foot { font-size: 12px; } .foot a { color: var(--muted); }
 section.sum { border-width: 2px; }
-@media print { .langs, .tip { display: none !important; } body { background: #fff; }
-  section { break-inside: avoid; } }
+/* Печать на один лист A4: заключение + графики сети и устройств.
+   Автоматические фразы и блок сервера на бумагу не выводятся. */
+@page { size: A4; margin: 12mm; }
+@media print {
+  .langs, .tip, .foot, #srv { display: none !important; }
+  * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  body { background: #fff; font-size: 12px; line-height: 1.4; }
+  main { max-width: none; padding: 0; }
+  .period { margin: 0 0 8px; }
+  section { break-inside: avoid; padding: 10px 12px 4px; margin-bottom: 8px; }
+  h2 { font-size: 14px; margin-bottom: 6px; }
+  li { margin: 2px 0; }
+  #net > h2, #net > ul { display: none; }
+  #dev h2 { font-size: 12px; }
+}
 </style>
 </head>
 <body>
