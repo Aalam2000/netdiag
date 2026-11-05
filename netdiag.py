@@ -57,10 +57,16 @@ LAN_NET = "192.168.0.0/24"       # локальная сеть (для подс�
 # сервер видит все устройства. Отчёт сравнивает «до» и «после».
 REBUILD_AT = "2026-10-24T00:00:00"
 
-# Короткий вывод в начале отчёта строится сам — по последним RECENT_DAYS суткам.
-RECENT_DAYS = 7
-BAD_HOUR_PCT = 2.0     # час «со сбоем»: роутер не ответил на 2% запросов и больше,
+# Короткий вывод в начале отчёта строится сам: шкала делится на 15-минутки,
+# плохие 15-минутки одного вида склеиваются в эпизоды.
+EP_STEP_MIN = 15
+INET_BAD_PCT = 20.0    # интернет сбоил: внешние адреса не ответили на 20% проверок и больше
+INET_DOWN_PCT = 80.0   # ... на 80% и больше — «интернета не было»
+HANG_PCT = 50.0        # роутер завис: при этом не отвечал и его веб-интерфейс
+BAD_PCT = 2.0          # сбой роутера: его DNS не ответил на 2% запросов и больше,
 CTL_OK_PCT = 0.5       # а контрольный DNS 8.8.8.8 при этом почти не терял (< 0,5%)
+EP_LIST = 4            # сколько последних эпизодов показывать
+RECENT_DAYS = 7        # за сколько суток считать «обычное» число устройств
 
 # Что делали с сетью: показывается в выводе, если дата попала в период отчёта.
 EVENTS = [
@@ -1159,6 +1165,7 @@ def classify(data, rdns_trusted=True):
     gw_ok = False
     gw_seen = False
     gw_rtt = None
+    gw_n = gw_fail = 0
     rdns = None
     dns_try = dns_lost = ctl_try = ctl_lost = 0
     ext_total = ext_ok = ip_total = ip_ok = name_total = name_ok = 0
@@ -1174,6 +1181,8 @@ def classify(data, rdns_trusted=True):
             ctl_lost += d.get("lost", 0 if ok else 1)
         elif n.startswith("gw_"):
             gw_seen = True
+            gw_n += 1
+            gw_fail += 0 if ok else 1
             if ok:
                 gw_ok = True
                 r = d.get("rtt")
@@ -1211,6 +1220,8 @@ def classify(data, rdns_trusted=True):
         "state": state, "gw_ok": gw_ok, "gw_rtt": gw_rtt, "rdns": rdns,
         "dns_try": dns_try, "dns_lost": dns_lost,
         "ctl_try": ctl_try, "ctl_lost": ctl_lost,
+        "ext_try": ext_total, "ext_fail": ext_total - ext_ok,
+        "gw_n": gw_n, "gw_fail": gw_fail,
         "ext_rtt": statistics.median(ext_rtts) if ext_rtts else None,
     }
 
@@ -1228,7 +1239,8 @@ def _stat():
             "cpu_max": 0.0, "mem_max": 0.0,
             "bc_n": 0, "bc_sec": 0.0, "bc_max": 0.0,         # широковещательные
             "dev_sum": 0, "dev_n": 0, "dev_max": 0, "outages": 0,
-            "tot_sum": 0, "tot_n": 0, "tot_max": 0}    # все устройства, с постоянными
+            "tot_sum": 0, "tot_n": 0, "tot_max": 0,
+            "ext_try": 0, "ext_fail": 0, "gw_n": 0, "gw_fail": 0}    # все устройства, с постоянными
 
 
 def bucket_of(dev):
@@ -1466,6 +1478,10 @@ class Analyzer:
                 s["bad"] += 1
             if state == "blackout":
                 s["black_sec"] += dt
+            s["ext_try"] += c["ext_try"]
+            s["ext_fail"] += c["ext_fail"]
+            s["gw_n"] += c["gw_n"]
+            s["gw_fail"] += c["gw_fail"]
             if c["gw_rtt"] is not None:
                 s["rtt"].append(c["gw_rtt"])
             if c["ext_rtt"] is not None:
@@ -2433,7 +2449,8 @@ def _merge(stats):
                   "ctl_try", "ctl_lost", "dev_sum", "dev_n",
                   "join", "left", "scans", "rx_bits", "tx_bits", "tr_sec",
                   "b_n", "b_lost", "cpu_sum", "mem_sum", "sys_n",
-                  "bc_n", "bc_sec", "tot_sum", "tot_n"):
+                  "bc_n", "bc_sec", "tot_sum", "tot_n",
+                  "ext_try", "ext_fail", "gw_n", "gw_fail"):
             m[k] += s[k]
         m["bc_max"] = max(m["bc_max"], s["bc_max"])
         m["tot_max"] = max(m["tot_max"], s["tot_max"])
@@ -2472,6 +2489,7 @@ def build_timeline(A):
             "label": label, "n": m["n"],
             "bad": _r(pct(m["bad"], m["n"])),
             "black": _r(pct(m["black_sec"], m["sec"])),
+            "inet": _inet_bad(m),
             "dns": _r(pct(m["dns_lost"], m["dns_try"])) if m["dns_try"] else None,
             "ctl": _r(pct(m["ctl_lost"], m["ctl_try"])) if m["ctl_try"] else None,
             "rm": _r(quantile(m["rtt"], 0.5), 1), "r95": _r(quantile(m["rtt"], 0.95), 1),
@@ -2773,6 +2791,101 @@ def _loss(A, m):
     return pct(m["bad"], m["n"]) if m["n"] else None
 
 
+def _inet_bad(m):
+    """Интернет сбоил: внешние адреса часто не отвечали или был обрыв."""
+    xf = pct(m["ext_fail"], m["ext_try"]) if m["ext_try"] else 0
+    return xf >= INET_BAD_PCT or m["black_sec"] >= OUTAGE_MIN_SEC
+
+
+def _block_kind(A, m):
+    """Вид 15-минутки: None (норма), inet, hang, router. Пик — в процентах."""
+    if not m["n"]:
+        return None, 0
+    if _inet_bad(m):
+        xf = pct(m["ext_fail"], m["ext_try"]) if m["ext_try"] else 0
+        if m["gw_n"] and pct(m["gw_fail"], m["gw_n"]) >= HANG_PCT:
+            return "hang", xf
+        return "inet", xf
+    lo = _loss(A, m)
+    ctl = pct(m["ctl_lost"], m["ctl_try"]) if m["ctl_try"] else 0
+    if lo is not None and lo >= BAD_PCT and ctl < CTL_OK_PCT:
+        return "router", lo
+    return None, 0
+
+
+def episodes(A):
+    """Эпизоды сбоев: [{kind, start, end, peak, ptime}] по местному времени."""
+    per = EP_STEP_MIN * 60 // TL_STEP_SEC
+    blocks = {}
+    for k, st in A.tl.items():
+        blocks.setdefault(k // per, []).append(st)
+    end_data = A.last.astimezone(TZ).replace(tzinfo=None)
+    eps, cur, last_b = [], None, None
+    for b in sorted(blocks):
+        mb = _merge(blocks[b])
+        kind, peak = _block_kind(A, mb)
+        t = _tl_time(b * per * TL_STEP_SEC)
+        # соседние плохие 15-минутки одного вида (допускается одна чистая между ними)
+        if cur and (kind != cur["kind"] or b - last_b > 2) and kind is not None:
+            cur = None
+        if cur and kind is None and b - last_b > 1:
+            cur = None
+        if kind is None:
+            continue
+        if cur is None:
+            cur = {"kind": kind, "start": t, "peak": 0, "ptime": t, "black": 0.0}
+            eps.append(cur)
+        cur["end"] = min(t + timedelta(minutes=EP_STEP_MIN), end_data)
+        cur["black"] += mb["black_sec"]
+        if peak > cur["peak"]:
+            cur["peak"], cur["ptime"] = peak, t
+        last_b = b
+    return eps, end_data
+
+
+def _span_txt(A):
+    h = (A.last - A.first).total_seconds() / 3600
+    if h < 48:
+        n = max(1, round(h))
+        return ({"ru": plural(n, "час", "часа", "часов"), "az": f"{n} saat"})
+    n = round(h / 24)
+    return {"ru": plural(n, "сутки", "суток", "суток"), "az": f"{n} gün"}
+
+
+def _ep_txt(e, now=False):
+    t0, t1 = e["start"], e["end"]
+    when = (f"{t0:%d.%m %H:%M}–{t1:%H:%M}" if t0.date() == t1.date()
+            else f"{t0:%d.%m %H:%M} – {t1:%d.%m %H:%M}")
+    pk = round(e["peak"])
+    if e["kind"] == "inet":
+        if e["peak"] >= INET_DOWN_PCT:
+            ru, az = "интернета не было (провайдер)", "internet yox idi (provayder)"
+        elif e["black"] >= OUTAGE_MIN_SEC:
+            mn = max(1, round(e["black"] / 60))
+            ru, az = (f"интернет пропадал, всего на {mn} мин",
+                      f"internet itib, cəmi {mn} dəq")
+        else:
+            ru, az = (f"интернет работал с перебоями, до {pk}% проверок без ответа",
+                      f"internet fasilələrlə işləyib, yoxlamaların {pk}%-ə qədəri cavabsız")
+    elif e["kind"] == "hang":
+        ru, az = "роутер завис: не отвечал совсем", "router donub: heç cavab vermirdi"
+    else:
+        ru, az = (f"роутер терял запросы, до {pk}%",
+                  f"router sorğuları itirirdi, {pk}%-ə qədər")
+    if now:
+        if e["kind"] == "inet":
+            ru, az = (("нет интернета (провайдер)", "internet yoxdur (provayder)")
+                      if e["peak"] >= INET_DOWN_PCT else
+                      ("интернет работает с перебоями", "internet fasilələrlə işləyir"))
+        elif e["kind"] == "hang":
+            ru, az = "роутер не отвечает", "router cavab vermir"
+        else:
+            ru, az = "роутер теряет запросы", "router sorğuları itirir"
+        since = f"{t0:%H:%M}" if t0.date() == t1.date() else f"{t0:%d.%m %H:%M}"
+        return {"ru": f"{ru}, с {since}", "az": f"{az}, {since}-dan"}
+    return {"ru": f"{when} — {ru}.", "az": f"{when} — {az}."}
+
+
 def brief(A):
     """Один короткий вывод о текущем состоянии + подписи к графикам."""
     H = _hours(A)
@@ -2780,65 +2893,52 @@ def brief(A):
         return {"sum": None, "cap": {}}
     first, last = min(H), max(H)
     recent = last - timedelta(days=RECENT_DAYS)
-    loss = {h: _loss(A, m) for h, m in H.items()}
-    bad = [h for h, m in H.items() if loss[h] is not None and loss[h] >= BAD_HOUR_PCT
-           and (pct(m["ctl_lost"], m["ctl_try"]) if m["ctl_try"] else 0) < CTL_OK_PCT]
-    rbad = [h for h in bad if h >= recent]
+    eps, end_data = episodes(A)
+    span = _span_txt(A)
     lines = []
-    if not rbad:
-        ok = True
-        head = {"ru": "Сейчас сеть работает стабильно", "az": "Hazırda şəbəkə sabit işləyir"}
-        if bad:
-            since = (max(bad) + timedelta(days=1)).date()
-            lines.append({"ru": f"С {since:%d.%m} сбоев роутера нет: ни в один час он не терял "
-                                f"{BAD_HOUR_PCT:.0f}% запросов и больше.",
-                          "az": f"{since:%d.%m} tarixindən router nasazlığı yoxdur: heç bir saatda "
-                                f"sorğuların {BAD_HOUR_PCT:.0f}%-ni və daha çoxunu itirməyib."})
-        else:
-            lines.append({"ru": "Сбоев роутера за весь период не было.",
-                          "az": "Bütün dövr ərzində router nasazlığı olmayıb."})
-    else:
+    cur = eps[-1] if eps and eps[-1]["end"] >= end_data else None     # ещё идёт
+    if cur:
         ok = False
-        lb = max(rbad)
-        n = len(rbad)
-        head = {"ru": "Сейчас есть сбои роутера", "az": "Hazırda router nasazlıqları var"}
-        lines.append({"ru": f"За последние {RECENT_DAYS} дней — {plural(n, 'час', 'часа', 'часов')} "
-                            f"со сбоями, последний {lb:%d.%m в %H:00}: роутер не ответил на "
-                            f"{loss[lb]:.0f}% запросов.",
-                      "az": f"Son {RECENT_DAYS} gündə nasazlıqlı {n} saat olub, sonuncu — "
-                            f"{lb:%d.%m, saat %H:00}: router sorğuların {loss[lb]:.0f}%-nə "
-                            "cavab verməyib."})
+        tx = _ep_txt(cur, now=True)
+        head = {"ru": "Сейчас сбой: " + tx["ru"], "az": "Hazırda nasazlıq: " + tx["az"]}
+    elif eps:
+        ok = True
+        e = eps[-1]
+        head = {"ru": f"Сейчас всё работает. Последний сбой закончился {e['end']:%d.%m в %H:%M}",
+                "az": f"Hazırda hər şey işləyir. Son nasazlıq {e['end']:%d.%m, saat %H:%M}-da bitib"}
+    else:
+        ok = True
+        head = {"ru": "Сеть работает без сбоев", "az": "Şəbəkə nasazlıqsız işləyir"}
+    if eps:
+        nr = sum(e["kind"] in ("router", "hang") for e in eps)
+        ni = len(eps) - nr
+        lines.append({"ru": f"За {span['ru']}: сбоев роутера — {nr}, перебоев интернета — {ni}."
+                            + (" Последние:" if len(eps) > EP_LIST else ""),
+                      "az": f"{span['az']} ərzində: router nasazlığı — {nr}, internet "
+                            f"fasiləsi — {ni}." + (" Sonuncular:" if len(eps) > EP_LIST else "")})
+        lines += [_ep_txt(e) for e in eps[-EP_LIST:]]
+    else:
+        lines.append({"ru": f"За {span['ru']} сбоев не было.",
+                      "az": f"{span['az']} ərzində nasazlıq olmayıb."})
     for d, txt in EVENTS:
         dt = date.fromisoformat(d)
         if first.date() <= dt <= last.date():
             lines.append({"ru": f"{dt:%d.%m} — {txt['ru']}.", "az": f"{dt:%d.%m} — {txt['az']}."})
-    outs = [e for e in A.events if e["kind"] == "outage"]
-    if outs:
-        t = outs[-1]["start"]
-        lines.append({"ru": f"Интернет пропадал {plural(len(outs), 'раз', 'раза', 'раз')}, "
-                            f"последний — {t:%d.%m в %H:%M}.",
-                      "az": f"İnternet {len(outs)} dəfə itib, sonuncu — {t:%d.%m, saat %H:%M}."})
-    else:
-        lines.append({"ru": "Обрывов интернета не было.", "az": "İnternet kəsintisi olmayıb."})
     lines += NOTES
 
     cap = {}
-    rl = [(loss[h], h) for h in H if h >= recent and loss[h] is not None]
-    al = [(loss[h], h) for h in H if loss[h] is not None]
-    if rl:
-        wr, hr = max(rl)
-        wa, ha = max(al)
-        if wr == 0:
-            ru = f"Последние {RECENT_DAYS} дней роутер ответил на все запросы."
-            az = f"Son {RECENT_DAYS} gündə router bütün sorğulara cavab verib."
-        else:
-            wr_s = f"{wr:.0f}" if wr >= 1 else f"{wr:.1f}".replace(".", ",")
-            ru = f"Последние {RECENT_DAYS} дней: худший час — {wr_s}% ({hr:%d.%m, %H:00})."
-            az = f"Son {RECENT_DAYS} gün: ən pis saat — {wr_s}% ({hr:%d.%m, %H:00})."
-        if ha < recent and wa >= max(wr * 2, BAD_HOUR_PCT):
-            ru += f" Раньше бывало до {wa:.0f}% ({ha:%d.%m})."
-            az += f" Əvvəl {wa:.0f}%-ə qədər olub ({ha:%d.%m})."
-        cap["net"] = {"ru": ru, "az": az}
+    rr = [e for e in eps if e["kind"] == "router"]
+    if rr:
+        w = max(rr, key=lambda e: e["peak"])
+        t2 = w["ptime"] + timedelta(minutes=EP_STEP_MIN)
+        cap["net"] = {"ru": f"Худший сбой роутера — {round(w['peak'])}% запросов без ответа "
+                            f"({w['ptime']:%d.%m, %H:%M}–{t2:%H:%M}). Красным — когда сбоил интернет.",
+                      "az": f"Routerin ən pis nasazlığı — sorğuların {round(w['peak'])}%-i cavabsız "
+                            f"({w['ptime']:%d.%m, %H:%M}–{t2:%H:%M}). Qırmızı — internetin "
+                            "nasaz olduğu vaxt."}
+    else:
+        cap["net"] = {"ru": "Сбоев роутера не было. Красным — когда сбоил интернет.",
+                      "az": "Router nasazlığı olmayıb. Qırmızı — internetin nasaz olduğu vaxt."}
     tot = {h: m for h, m in H.items() if m["tot_n"]}
     if tot:
         rec = {h: m for h, m in tot.items() if h >= recent} or tot
@@ -2894,7 +2994,7 @@ def render_html(A, B):
     # если DNS роутера не проверялся — доля замеров с отклонениями
     key = "dns" if A.has_rdns else "bad"
     net_pts = [{"l": p["label"], "v": p.get(key), "e": p.get("bad"),
-                "o": bool(p.get("black"))}
+                "o": bool(p.get("inet"))}
                if p["n"] else {"l": p["label"]} for p in points]
     srv_pts = [{"l": p["label"], "a": p.get("cpu"), "b": p.get("mem")}
                if p["n"] else {"l": p["label"]} for p in points]
