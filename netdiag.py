@@ -3102,7 +3102,7 @@ section.sum { border-width: 2px; }
    Автоматические фразы и блок сервера на бумагу не выводятся. */
 @page { size: A4; margin: 12mm; }
 @media print {
-  .langs, .tip, .foot, #srv { display: none !important; }
+  .langs, .tip, .foot { display: none !important; }
   * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
   body { background: #fff; font-size: 12px; line-height: 1.4; }
   main { max-width: none; padding: 0; }
