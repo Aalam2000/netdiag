@@ -65,7 +65,6 @@ INET_DOWN_PCT = 80.0   # ... на 80% и больше — «интернета �
 HANG_PCT = 50.0        # роутер завис: при этом не отвечал и его веб-интерфейс
 BAD_PCT = 2.0          # сбой роутера: его DNS не ответил на 2% запросов и больше,
 CTL_OK_PCT = 0.5       # а контрольный DNS 8.8.8.8 при этом почти не терял (< 0,5%)
-EP_LIST = 4            # сколько последних эпизодов показывать
 RECENT_DAYS = 7        # за сколько суток считать «обычное» число устройств
 
 # Что делали с сетью: показывается в выводе, если дата попала в период отчёта.
@@ -2886,6 +2885,36 @@ def _ep_txt(e, now=False):
     return {"ru": f"{when} — {ru}.", "az": f"{when} — {az}."}
 
 
+def _ep_short(e):
+    """«21:00–22:30 (до 21%)» — для строки по дням."""
+    t0, t1 = e["start"], e["end"]
+    when = f"{t0:%H:%M}–{t1:%H:%M}" + ("" if t0.date() == t1.date() else f" {t1:%d.%m}")
+    pk = round(e["peak"])
+    if e["kind"] == "router":
+        return {"ru": f"{when} (до {pk}%)", "az": f"{when} ({pk}%-ə qədər)"}
+    if e["kind"] == "hang":
+        return {"ru": f"{when} (завис)", "az": f"{when} (donub)"}
+    if e["peak"] >= INET_DOWN_PCT:
+        return {"ru": f"{when} (интернета не было)", "az": f"{when} (internet yox idi)"}
+    if e["black"] >= OUTAGE_MIN_SEC:
+        mn = max(1, round(e["black"] / 60))
+        return {"ru": f"{when} (обрыв {mn} мин)", "az": f"{when} ({mn} dəq kəsinti)"}
+    return {"ru": f"{when} (перебои, до {pk}%)", "az": f"{when} (fasilələr, {pk}%-ə qədər)"}
+
+
+def _ep_group(eps, ru_name, az_name, ru_none, az_none, words):
+    """Одна строка: все эпизоды группы, сгруппированные по дням."""
+    if not eps:
+        return {"ru": f"{ru_name} — {ru_none}.", "az": f"{az_name} — {az_none}."}
+    days = {}
+    for e in eps:
+        days.setdefault(e["start"].date(), []).append(_ep_short(e))
+    ru = "; ".join(f"{d:%d.%m} — " + ", ".join(x["ru"] for x in v) for d, v in days.items())
+    az = "; ".join(f"{d:%d.%m} — " + ", ".join(x["az"] for x in v) for d, v in days.items())
+    return {"ru": f"{ru_name} — {plural(len(eps), *words)}: {ru}.",
+            "az": f"{az_name} — {len(eps)}: {az}."}
+
+
 def brief(A):
     """Один короткий вывод о текущем состоянии + подписи к графикам."""
     H = _hours(A)
@@ -2900,26 +2929,28 @@ def brief(A):
     if cur:
         ok = False
         tx = _ep_txt(cur, now=True)
-        head = {"ru": "Сейчас сбой: " + tx["ru"], "az": "Hazırda nasazlıq: " + tx["az"]}
+        prov = cur["kind"] == "inet"
+        head = {"ru": ("Сейчас сбой провайдера: " if prov else "Сейчас сбой роутера: ") + tx["ru"],
+                "az": ("Hazırda provayder nasazlığı: " if prov else "Hazırda router nasazlığı: ")
+                      + tx["az"]}
     elif eps:
         ok = True
         e = eps[-1]
-        head = {"ru": f"Сейчас всё работает. Последний сбой закончился {e['end']:%d.%m в %H:%M}",
-                "az": f"Hazırda hər şey işləyir. Son nasazlıq {e['end']:%d.%m, saat %H:%M}-da bitib"}
+        who = ("провайдера", "provayder") if e["kind"] == "inet" else ("роутера", "router")
+        head = {"ru": f"Сейчас всё работает. Последний сбой ({who[0]}) закончился "
+                      f"{e['end']:%d.%m в %H:%M}",
+                "az": f"Hazırda hər şey işləyir. Son nasazlıq ({who[1]}) "
+                      f"{e['end']:%d.%m, saat %H:%M}-da bitib"}
     else:
         ok = True
         head = {"ru": "Сеть работает без сбоев", "az": "Şəbəkə nasazlıqsız işləyir"}
-    if eps:
-        nr = sum(e["kind"] in ("router", "hang") for e in eps)
-        ni = len(eps) - nr
-        lines.append({"ru": f"За {span['ru']}: сбоев роутера — {nr}, перебоев интернета — {ni}."
-                            + (" Последние:" if len(eps) > EP_LIST else ""),
-                      "az": f"{span['az']} ərzində: router nasazlığı — {nr}, internet "
-                            f"fasiləsi — {ni}." + (" Sonuncular:" if len(eps) > EP_LIST else "")})
-        lines += [_ep_txt(e) for e in eps[-EP_LIST:]]
-    else:
-        lines.append({"ru": f"За {span['ru']} сбоев не было.",
-                      "az": f"{span['az']} ərzində nasazlıq olmayıb."})
+    lines.append({"ru": f"Период отчёта — {span['ru']}.", "az": f"Hesabat dövrü — {span['az']}."})
+    lines.append(_ep_group([e for e in eps if e["kind"] in ("router", "hang")],
+                           "Роутер", "Router", "сбоев не было", "nasazlıq olmayıb",
+                           ("сбой", "сбоя", "сбоев")))
+    lines.append(_ep_group([e for e in eps if e["kind"] == "inet"],
+                           "Провайдер", "Provayder", "перебоев не было", "fasilə olmayıb",
+                           ("перебой", "перебоя", "перебоев")))
     for d, txt in EVENTS:
         dt = date.fromisoformat(d)
         if first.date() <= dt <= last.date():
