@@ -1,0 +1,9 @@
+# Печать отчёта: Chromium рисует страницу (графики на JS) в PDF,
+# CUPS переводит PDF в растр для принтера без драйвера (IPP Everywhere).
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        chromium cups cups-client cups-filters ghostscript poppler-utils \
+        fonts-dejavu-core fonts-liberation tzdata ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    # CUPS слушает только сокет: на хосте порт 631 не занимаем
+    && sed -i 's/^Listen localhost:631/# &/; s/^Port 631/# &/' /etc/cups/cupsd.conf
