@@ -3251,9 +3251,13 @@ svg.chart text { fill: var(--muted); font-size: 11px; font-variant-numeric: tabu
 .tip .t { color: var(--text2); }
 .foot { font-size: 12px; } .foot a { color: var(--muted); }
 section.sum { border-width: 2px; }
-.cap { font-size: 13px; color: var(--text2); margin: 4px 0 8px; }
-/* Печать на один лист A4: заключение + графики сети и устройств.
-   Автоматические фразы и блок сервера на бумагу не выводятся. */
+.cap { font-size: 13px; font-weight: 600; color: var(--text); margin: 4px 0 8px; }
+/* шапка графика в одну строку: заголовок слева, обозначения линий справа */
+.hd { display: flex; align-items: center; justify-content: space-between;
+  flex-wrap: wrap; gap: 2px 16px; margin-bottom: 6px; }
+.hd h2, .hd .legend { margin: 0; }
+/* Печать на один лист A4: вывод и все три графика.
+   netdiag print добавляет ?print=1 — графики ниже. */
 @page { size: A4; margin: 12mm; }
 @media print {
   .langs, .tip, .foot { display: none !important; }
@@ -3279,17 +3283,17 @@ section.sum { border-width: 2px; }
   </div>
   <div class="period" id="period"></div>
   <section id="sum" class="sum"><h2 class="ok"><i></i><span></span></h2><ul></ul></section>
-  <section id="net"><h2 data-t="netTitle"></h2>
+  <section id="net"><div class="hd"><h2 data-t="netTitle"></h2>
     <div class="legend"><span><i style="background:var(--s1)"></i><b data-t="errLeg"></b></span>
-      <span><i style="background:var(--bad)"></i><b data-t="outLeg"></b></span></div>
+      <span><i style="background:var(--bad)"></i><b data-t="outLeg"></b></span></div></div>
     <div class="plot"></div><div class="tip"></div><p class="cap"></p></section>
-  <section id="dev"><h2 data-t="devTitle"></h2>
+  <section id="dev"><div class="hd"><h2 data-t="devTitle"></h2>
     <div class="legend"><span><i style="background:var(--s1)"></i><b data-t="devAvg"></b></span>
-      <span><i style="background:var(--s2)"></i><b data-t="devMax"></b></span></div>
+      <span><i style="background:var(--s2)"></i><b data-t="devMax"></b></span></div></div>
     <div class="plot"></div><div class="tip"></div><p class="cap"></p></section>
-  <section id="srv"><h2 data-t="srvTitle"></h2>
+  <section id="srv"><div class="hd"><h2 data-t="srvTitle"></h2>
     <div class="legend"><span><i style="background:var(--s1)"></i><b data-t="cpu"></b></span>
-      <span><i style="background:var(--s2)"></i><b data-t="mem"></b></span></div>
+      <span><i style="background:var(--s2)"></i><b data-t="mem"></b></span></div></div>
     <div class="plot"></div><div class="tip"></div><p class="cap"></p></section>
   <div class="foot"><a href="report-full.txt" target="_blank" data-t="foot"></a></div>
 </main>
@@ -3326,7 +3330,9 @@ section.sum { border-width: 2px; }
     var box = sec.querySelector(".plot"), tip = sec.querySelector(".tip");
     box.textContent = "";
     if (!pts) { sec.querySelector(".legend").style.display = "none"; return; }
-    var W = Math.max(320, box.clientWidth), H = opt.h, m = { l: 36, r: 8, t: 8, b: 22 };
+    // ?print=1 (netdiag print): графики ниже, чтобы всё вошло на один лист A4
+    var W = Math.max(320, box.clientWidth), m = { l: 36, r: 8, t: 8, b: 22 },
+        H = Math.round(opt.h * (/[?&]print=1/.test(location.search) ? 0.55 : 1));
     var pw = W - m.l - m.r, ph = H - m.t - m.b, N = pts.length;
     var mx = opt.floor;
     pts.forEach(function (p) { opt.keys.forEach(function (k) { if (p[k] != null && p[k] > mx) mx = p[k]; }); });

@@ -3,7 +3,7 @@
 # $1 — язык страницы: az (по умолчанию) или ru.
 set -e
 L="${1:-az}"
-URL="http://127.0.0.1:${NETDIAG_HTTP_PORT:-8090}/?lang=$L"
+URL="http://127.0.0.1:${NETDIAG_HTTP_PORT:-8090}/?lang=$L&print=1"
 PDF="/data/print-$L.pdf"
 
 echo "[*] Страница $URL → PDF"
@@ -23,7 +23,15 @@ done
 echo "[*] Принтер $PRINTER_URI"
 lpadmin -p epson -E -v "$PRINTER_URI" -m everywhere \
     || { echo "[!] Принтер не ответил (включён? ufw пускает на порт 631?)"; exit 1; }
-lp -d epson -o media=iso_a4_210x297mm -o fit-to-page "$PDF"
+# описание принтера (PPD) CUPS создаёт в фоне, ~10 с. Без него очередь
+# «сырая» и принтер печатает PDF как текст — поэтому ждём, а не печатаем сразу
+i=0
+until grep -q '^\*cupsFilter2' /etc/cups/ppd/epson.ppd 2>/dev/null; do
+    i=$((i + 1)); [ "$i" -gt 45 ] && { echo "[!] Принтер не ответил на запрос параметров (включён?)"; exit 1; }
+    sleep 2
+done
+echo "[*] PDF: $(pdfinfo "$PDF" 2>/dev/null | sed -n 's/^Pages: *//p') стр."
+lp -d epson -o page-ranges=1 -o media=iso_a4_210x297mm -o fit-to-page -o document-format=application/pdf "$PDF"
 
 # контейнер удаляется после выхода — ждём, пока задание уйдёт на принтер
 i=0
