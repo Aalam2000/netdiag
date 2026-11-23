@@ -31,6 +31,7 @@ import struct
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from array import array
 from collections import Counter, defaultdict, deque
@@ -204,12 +205,19 @@ OUT_FULL   = f"{WORK_DIR}/report-full.txt"   # подробный техниче
 HEARTBEAT  = f"{WORK_DIR}/heartbeat"
 
 # Отчёт по сети: отдельный контейнер netdiag-report (команда serve) раз в
-# REPORT_EVERY_MIN перестраивает отчёт за последние REPORT_DAYS суток и
-# отдаёт его по HTTP — только чтение, только файлы отчёта. Сайт ставит на
-# него ссылку или проксирует путь /netdiag/ на этот порт.
-REPORT_EVERY_MIN   = 60
+# неделю (REPORT_WEEKDAY, REPORT_HOUR по Баку) строит отчёт за последние
+# REPORT_DAYS суток и отдаёт его по HTTP — только чтение, только файлы
+# отчёта. Сайт ставит на него ссылку или проксирует путь /netdiag/ на этот порт.
+REPORT_WEEKDAY     = 1       # 0 — понедельник, 1 — вторник
+REPORT_HOUR        = 10      # к 12:00 отчёт уже готов для печати
 REPORT_HTTP_BIND   = os.environ.get("NETDIAG_HTTP_BIND", "0.0.0.0")
 REPORT_HTTP_PORT   = int(os.environ.get("NETDIAG_HTTP_PORT", "8090"))
+
+# Вывод в начале отчёта пишет Gemini по сводке цифр (без MAC и IP).
+# Ключ — GEMINI_API_KEY из .env. Нет ключа или ответа — остаётся наш текст.
+GEMINI_MODELS  = ["gemini-3.5-flash", "gemini-3.8-flash"]  # по порядку, если первая занята
+GEMINI_TRIES   = 2       # попыток на модель (при перегрузке)
+GEMINI_TIMEOUT = 180     # сек на один запрос
 # ================
 
 os.makedirs(WORK_DIR, exist_ok=True)
@@ -3001,6 +3009,144 @@ def brief(A):
     return {"sum": {"head": head, "ok": ok, "lines": lines}, "cap": cap}
 
 
+# ---- вывод от Gemini ----
+
+GEMINI_PROMPT = """Ты — сетевой инженер. Ниже в JSON — замеры офисной сети учебного \
+центра (Баку). Напиши вывод о качестве работы сети для руководства: простыми \
+словами, без жаргона, на русском (ru) и азербайджанском (az), смысл одинаковый.
+
+Что написать:
+- head: одно предложение — общее состояние сети за последние 7 дней.
+- lines: 3–6 коротких пунктов: как работали роутер и интернет провайдера за \
+последние 7 дней (когда, как долго, насколько мешало); сравнение с предыдущими \
+7 днями; что можно сказать о Wi-Fi; риски и прогноз — что вероятно будет \
+дальше при нынешнем положении.
+- ok: true, если за последние 7 дней не было сбоев, заметных людям.
+
+Правила:
+- Только то, что следует из данных. Не выдумывай причины; если причину по \
+данным не определить — так и скажи.
+- Никаких советов, рекомендаций, оборудования, брендов, покупок и намёков на \
+них. Только состояние и риски.
+- «Роутер»: DNS роутера терял запросы, а контрольный DNS 8.8.8.8 почти нет. \
+«Провайдер»: не отвечали внешние адреса. Если роутер отвечал, а трафик \
+наружу не шёл, роутер и провайдера не отличить — так и пиши. Пока нет \
+интернета, молчание DNS роутера не считается его сбоем.
+- Связь сбоев с нагрузкой утверждай, только если она видна в цифрах \
+(число устройств в часы сбоев против обычного).
+- Wi-Fi сервер не измеряет (он подключён кабелем). О Wi-Fi говори только то, \
+что есть в notes, и прямо скажи, что замеров Wi-Fi нет.
+- Учебное время — примерно %d:00–%d:00; оцени, приходились ли сбои на него.
+- Проценты — целые, время — как 20:00–22:00, даты — как 19.11.
+
+Ответ — только JSON:
+{"ok": true, "head": {"ru": "...", "az": "..."}, "lines": [{"ru": "...", "az": "..."}]}
+""" % WORK_HOURS
+
+
+def gemini_payload(A):
+    """Сводка цифр для Gemini: без MAC, IP и имён устройств."""
+    def p(a, b):
+        return round(100 * a / b, 1) if b else None
+    rows = []
+    for h, m in _hours(A).items():
+        if not m["n"]:
+            continue
+        rows.append([f"{h:%Y-%m-%d %H}", WD_NAMES[h.weekday()],
+                     round(m["tot_sum"] / m["tot_n"]) if m["tot_n"] else None,
+                     m["tot_max"] if m["tot_n"] else None,
+                     p(m["dns_lost"], m["dns_try"]), p(m["ctl_lost"], m["ctl_try"]),
+                     p(m["ext_fail"], m["ext_try"]), round(m["black_sec"]),
+                     p(m["gw_fail"], m["gw_n"])])
+    eps, end_data = episodes(A)
+    kinds = {"router": "роутер терял DNS-запросы",
+             "hang": "роутер не отвечал совсем, интернета не было",
+             "inet": "не отвечали внешние адреса (провайдер или роутер)"}
+    last = A.last.astimezone(TZ).replace(tzinfo=None)
+    return {
+        "period": f"{A.first.astimezone(TZ):%Y-%m-%d %H:%M} — {last:%Y-%m-%d %H:%M}",
+        "last7_from": f"{last - timedelta(days=7):%Y-%m-%d %H:%M}",
+        "network": "один главный роутер (раздаёт интернет и DNS), несколько "
+                   "Wi-Fi точек доступа в режиме точки; одна общая сеть",
+        "how_measured": "сервер подключён кабелем; каждые 5 с: DNS-запрос к роутеру, "
+                        "контрольный DNS-запрос к 8.8.8.8, TCP к 6 внешним адресам, "
+                        "TCP к веб-интерфейсу роутера; раз в минуту — число устройств в сети",
+        "hours_cols": ["час", "день", "устройств_ср", "устройств_макс",
+                       "DNS_роутера_потери_%", "DNS_8.8.8.8_потери_%",
+                       "внешние_без_ответа_%", "сек_полного_обрыва",
+                       "веб_роутера_без_ответа_%"],
+        "hours": rows,
+        "episodes": [{"kind": kinds[e["kind"]],
+                      "start": f"{e['start']:%Y-%m-%d %H:%M}",
+                      "end": f"{e['end']:%Y-%m-%d %H:%M}",
+                      "peak_pct": round(e["peak"]),
+                      "full_outage_min": round(e["black"] / 60, 1),
+                      "ongoing": e["end"] >= end_data} for e in eps],
+        "thresholds": {"шаг_эпизодов_мин": EP_STEP_MIN,
+                       "сбой_роутера_от_%": BAD_PCT, "сбой_интернета_от_%": INET_BAD_PCT},
+        "excluded": [f"{a:%Y-%m-%d %H:%M} — {b:%Y-%m-%d %H:%M}: только проверки "
+                     f"веб-интерфейса роутера не учитываются ({w['ru']})"
+                     for a, b, w in getattr(A, "excluded", [])],
+        "events": [f"{d}: {t['ru']}" for d, t in EVENTS],
+        "notes": [n["ru"] + " (по обходам с ноутбуком, не замер)" for n in NOTES],
+    }
+
+
+def _gemini_check(r):
+    """Ответ должен быть ровно нужной формы, иначе не используем."""
+    def lang(x):
+        return (isinstance(x, dict) and all(isinstance(x.get(k), str) and x[k].strip()
+                                            for k in ("ru", "az")))
+    lines = r.get("lines") if isinstance(r, dict) else None
+    if not (lang(r.get("head")) and isinstance(lines, list) and lines
+            and all(lang(x) for x in lines)):
+        raise ValueError("ответ Gemini не той формы")
+    lines = [{"ru": x["ru"].strip(), "az": x["az"].strip()} for x in lines[:8]]
+    lines.append({"ru": "Вывод составлен ИИ (Gemini) по замерам сервера.",
+                  "az": "Nəticə serverin ölçmələri əsasında süni intellekt (Gemini) "
+                        "tərəfindən hazırlanıb."})
+    return {"head": {"ru": r["head"]["ru"].strip(), "az": r["head"]["az"].strip()},
+            "ok": bool(r.get("ok")), "lines": lines}
+
+
+def gemini_summary(A):
+    """Вывод для руководства от Gemini или None."""
+    key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not key:
+        log.info("gemini: нет GEMINI_API_KEY, вывод — наш")
+        return None
+    body = json.dumps({
+        "systemInstruction": {"parts": [{"text": GEMINI_PROMPT}]},
+        "contents": [{"role": "user", "parts": [
+            {"text": json.dumps(gemini_payload(A), ensure_ascii=False)}]}],
+        "generationConfig": {"responseMimeType": "application/json"},
+    }, ensure_ascii=False).encode()
+    for model in GEMINI_MODELS:
+        url = ("https://generativelanguage.googleapis.com/v1beta/models/"
+               f"{model}:generateContent")
+        for i in range(GEMINI_TRIES):
+            req = urllib.request.Request(url, data=body, headers={
+                "Content-Type": "application/json", "x-goog-api-key": key})
+            try:
+                with urllib.request.urlopen(req, timeout=GEMINI_TIMEOUT) as f:
+                    res = json.load(f)
+                parts = res["candidates"][0]["content"]["parts"]
+                txt = "".join(x.get("text", "") for x in parts if not x.get("thought"))
+                S = _gemini_check(json.loads(txt))
+                log.info("gemini: вывод получен (%s)", model)
+                return S
+            except urllib.error.HTTPError as e:
+                log.warning("gemini %s: HTTP %s", model, e.code)
+                if e.code in (429, 500, 503) and i + 1 < GEMINI_TRIES:
+                    time.sleep(30)             # перегрузка — подождать и повторить
+                    continue
+                break
+            except Exception as e:
+                log.warning("gemini %s: %s", model, e)
+                break
+    return None
+
+
 def render_brief(A, B):
     L = ["ОТЧЁТ NETDIAG",
          f"{A.first:%d.%m.%y %H:%M} — {A.last:%d.%m.%y %H:%M}",
@@ -3429,6 +3575,12 @@ def build_report(since=None, until=None):
         return txt
     _write(OUT_FULL, render(A))            # подробный: для разбора, не для руководства
     B = brief(A)
+    try:
+        S = gemini_summary(A)
+        if S:
+            B["sum"] = S
+    except Exception as e:                     # без ИИ остаётся наш текст
+        log.warning("gemini failed: %s", e)
     txt = render_brief(A, B)
     _write(OUT_REPORT, txt)
     try:
@@ -3500,16 +3652,34 @@ def serve():
     except OSError:
         pass
     threading.Thread(target=report_server, daemon=True).start()
+    tried = 0.0
     while not _stop:
-        t0 = time.time()
+        slot = _last_slot(now())
         try:
-            build_report((now() - timedelta(days=REPORT_DAYS)).replace(
-                hour=0, minute=0, second=0, microsecond=0))
-            log.info("scheduled report built in %.0f s", time.time() - t0)
-        except Exception as e:
-            log.warning("scheduled report failed: %s", e)
-        while not _stop and time.time() - t0 < REPORT_EVERY_MIN * 60:
+            done = datetime.fromtimestamp(os.path.getmtime(OUT_HTML), TZ) >= slot
+        except OSError:
+            done = False
+        # не построен после последнего вторника 10:00 (в т.ч. сервер был
+        # выключен) — строим; после неудачи повторяем не чаще раза в час
+        if not done and time.time() - tried >= 3600:
+            tried = t0 = time.time()
+            try:
+                build_report((now() - timedelta(days=REPORT_DAYS)).replace(
+                    hour=0, minute=0, second=0, microsecond=0))
+                log.info("scheduled report built in %.0f s", time.time() - t0)
+            except Exception as e:
+                log.warning("scheduled report failed: %s", e)
+        for _ in range(60):
+            if _stop:
+                break
             time.sleep(1)
+
+
+def _last_slot(t):
+    """Последний момент «вторник 10:00» не позже t."""
+    d = t.replace(hour=REPORT_HOUR, minute=0, second=0, microsecond=0)
+    d -= timedelta(days=(d.weekday() - REPORT_WEEKDAY) % 7)
+    return d if d <= t else d - timedelta(days=7)
 
 
 def _parse_day(s):

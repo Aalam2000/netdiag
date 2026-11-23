@@ -8,3 +8,7 @@ netdiag.log
 .idea/
 # Python
 __pycache__/
+# Секреты и заметки для себя
+.env
+tmp/
+CLAUDE.md

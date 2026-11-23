@@ -19,7 +19,7 @@ services:
           cpus: '0.15'
           memory: 256M
 
-  # Отчёт: раз в час перестраивает и отдаёт по HTTP на порту 8090
+  # Отчёт: раз в неделю (вт 10:00) строит и отдаёт по HTTP на порту 8090
   # (для кнопки на сайте). Отдельный контейнер — построение отчёта не
   # отнимает процессор у сборщика и не искажает замеры.
   netdiag-report:
@@ -31,6 +31,9 @@ services:
     environment:
       - TZ=Asia/Baku
       - NETDIAG_HTTP_PORT=8090
+    env_file:                        # GEMINI_API_KEY; файла может не быть
+      - path: .env
+        required: false
     volumes:
       - ./netdiag.py:/app/netdiag.py:ro
       - ./data:/data

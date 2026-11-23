@@ -144,7 +144,7 @@ main() {
         tail -n 6 data/netdiag.log 2>/dev/null || true
         echo
         echo "[*] Установлена версия: $(version)"
-        echo "[*] Отчёт: http://$(hostname -I | awk '{print $1}'):8090/ (обновляется раз в час)"
+        echo "[*] Отчёт: http://$(hostname -I | awk '{print $1}'):8090/ (обновляется по вторникам в 10:00)"
         [ -n "$OLD" ] && [ "$OLD" != "$NEW" ] && echo "[*] Была: $OLD"
         echo "[*] Данные в ./data сохранены."
         [ -e /etc/bash_completion.d/netdiag ] || echo "[i] Подсказки по Tab не подключены: sudo ln -s $SCRIPT_DIR/netdiag-completion.bash /etc/bash_completion.d/netdiag"
