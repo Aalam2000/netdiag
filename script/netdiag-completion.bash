@@ -10,13 +10,16 @@ _netdiag() {
     cmd="${COMP_WORDS[1]}"
 
     if [ "$COMP_CWORD" -eq 1 ]; then
-        COMPREPLY=($(compgen -W "deploy start stop restart status log raw report down clean" -- "$cur"))
+        COMPREPLY=($(compgen -W "deploy start stop restart status log raw report print down clean" -- "$cur"))
         return
     fi
 
     case "$cmd" in
       deploy)
         [ "$COMP_CWORD" -eq 2 ] && COMPREPLY=($(compgen -W "--force" -- "$cur"))
+        ;;
+      print)
+        [ "$COMP_CWORD" -eq 2 ] && COMPREPLY=($(compgen -W "on off status --az --ru" -- "$cur"))
         ;;
       report)
         case "$prev" in

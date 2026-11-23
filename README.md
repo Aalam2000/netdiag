@@ -133,6 +133,17 @@ ufw.log — блокировки файрвола, auth.log — входы по 
 причина пишется в `netdiag.log`. Ручной `netdiag report` тоже спрашивает
 Gemini.
 
+Печать: `netdiag print [--az | --ru]` (по умолчанию азербайджанский).
+Временный контейнер `netdiag-print` (`Dockerfile.print`, `script/print.sh`)
+открывает `/?lang=az` в Chromium, сохраняет `data/print-az.pdf` и печатает
+через CUPS на Epson L3250 (`ipp://192.168.0.30/ipp/print`, без драйвера).
+По расписанию — вторник 12:00 по Баку: `netdiag print on` добавляет строку
+в crontab пользователя (часы сервера в UTC, поэтому `0 8 * * 2`),
+`netdiag print off` убирает её, `netdiag print status` — состояние и
+журнал `data/print.log`. Другие строки crontab не трогаются.
+
+ufw должен выпускать на принтер: `sudo ufw allow out to 192.168.0.30 port 631 proto tcp`.
+
 Чтобы поставить кнопку на сайт, сайт проксирует путь `/netdiag/` на
 `http://127.0.0.1:8090/` (если веб-сервер сайта в Docker —
 на `host.docker.internal:8090` и `sudo ufw allow in on <мост docker>

@@ -45,3 +45,23 @@ services:
         limits:
           cpus: '0.5'
           memory: 384M
+
+  # Печать отчёта: запускается только командой netdiag print (cron по
+  # вторникам), печатает и удаляется. Постоянно не работает.
+  netdiag-print:
+    build:
+      context: .
+      dockerfile: Dockerfile.print
+    image: netdiag-print
+    profiles: ["print"]
+    network_mode: host
+    environment:
+      - TZ=Asia/Baku
+      - NETDIAG_HTTP_PORT=8090
+      - PRINTER_URI=ipp://192.168.0.30/ipp/print    # Epson L3250, адрес закреплён
+    volumes:
+      - ./script/print.sh:/print.sh:ro
+      - ./data:/data
+      - /etc/localtime:/etc/localtime:ro
+    entrypoint: ["sh", "/print.sh"]
+    command: ["az"]

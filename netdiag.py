@@ -3109,12 +3109,18 @@ def _gemini_check(r):
             "ok": bool(r.get("ok")), "lines": lines}
 
 
+AI_STATUS = "ИИ не спрашивали"     # для строки в конце ручного report
+
+
 def gemini_summary(A):
     """Вывод для руководства от Gemini или None."""
+    global AI_STATUS
     key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not key:
+        AI_STATUS = "ИИ НЕ ОТВЕТИЛ: нет GEMINI_API_KEY в .env — в отчёте наш текст"
         log.info("gemini: нет GEMINI_API_KEY, вывод — наш")
         return None
+    AI_STATUS = "ИИ НЕ ОТВЕТИЛ — в отчёте наш текст, причина в netdiag.log"
     body = json.dumps({
         "systemInstruction": {"parts": [{"text": GEMINI_PROMPT}]},
         "contents": [{"role": "user", "parts": [
@@ -3133,6 +3139,8 @@ def gemini_summary(A):
                 parts = res["candidates"][0]["content"]["parts"]
                 txt = "".join(x.get("text", "") for x in parts if not x.get("thought"))
                 S = _gemini_check(json.loads(txt))
+                AI_STATUS = (f"ИИ ОТВЕТИЛ: Gemini ({model}) проанализировал данные, "
+                             f"вывод на RU и AZ — {len(S['lines']) - 1} пунктов")
                 log.info("gemini: вывод получен (%s)", model)
                 return S
             except urllib.error.HTTPError as e:
@@ -3306,6 +3314,8 @@ section.sum { border-width: 2px; }
   };
   var lang = "ru";
   try { lang = localStorage.getItem("netdiag-lang") || "ru"; } catch (e) {}
+  var qm = /[?&]lang=(\w+)/.exec(location.search);    // ?lang=az — для печати
+  if (qm) lang = qm[1];
   if (!UI[lang]) lang = "ru";
   var NS = "http://www.w3.org/2000/svg";
   function el(n, a, p) { var e = document.createElementNS(NS, n);
@@ -3706,6 +3716,7 @@ if __name__ == "__main__":
             since = (now() - timedelta(days=REPORT_DAYS)).replace(
                 hour=0, minute=0, second=0, microsecond=0)
         sys.stdout.write(build_report(since, until))
+        print(f"\n[*] {AI_STATUS}")
     elif len(sys.argv) > 1 and sys.argv[1] == "serve":
         serve()
     else:

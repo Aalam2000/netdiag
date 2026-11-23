@@ -17,7 +17,7 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_DIR"
 
 usage() {
-    echo "Использование: netdiag {deploy|start|stop|restart|status|log|raw|report|down|clean}"
+    echo "Использование: netdiag {deploy|start|stop|restart|status|log|raw|report|print|down|clean}"
     echo ""
     echo "  deploy   — взять последнюю версию из репозитория и перезапустить"
     echo "             deploy --force — то же, затирая правки, сделанные на сервере"
@@ -31,6 +31,10 @@ usage() {
     echo "             report --since 2026-10-12 --until 2026-10-19 — за период"
     echo "             report --days 30 — за последние 30 суток; --all — за всё время"
     echo "             report --fast — быстрее: без ограничения процессора"
+    echo "  print    — напечатать отчёт на Epson (по умолчанию на азербайджанском)"
+    echo "             print --az | --ru — язык листа"
+    echo "             print on | off — включить / выключить печать по вторникам в 12:00"
+    echo "             print status — включена ли печать, последние строки журнала"
     echo "  down     — удалить контейнер (данные остаются)"
     echo "  clean    — удалить контейнер и папку data/"
 }
@@ -205,6 +209,47 @@ main() {
         docker compose exec -T netdiag-report python /app/netdiag.py report "${ARGS[@]}"
         echo "[*] Для руководства: $PROJECT_DIR/data/report.html (открыть в браузере)"
         echo "[*] Подробно: $PROJECT_DIR/data/report-full.txt"
+        ;;
+
+      print)
+        shift
+        # расписание печати — строка в crontab с меткой; вторник 12:00 по Баку
+        # (часы сервера в UTC). Остальные строки crontab не трогаем.
+        MARK="# netdiag-print"
+        CRON_LINE="0 8 * * 2 /usr/local/bin/netdiag print >> $PROJECT_DIR/data/print.log 2>&1 $MARK"
+        case "$1" in
+          on)
+            # сначала читаем crontab целиком, потом записываем — строки LMS не теряются
+            KEEP="$(crontab -l 2>/dev/null | grep -vF "$MARK" || true)"
+            printf '%s\n' "$KEEP" "$CRON_LINE" | sed '/^$/d' | crontab -
+            echo "[*] Печать по расписанию ВКЛЮЧЕНА: каждый вторник в 12:00 (Баку)."
+            echo "[*] Журнал: $PROJECT_DIR/data/print.log"
+            exit 0 ;;
+          off)
+            KEEP="$(crontab -l 2>/dev/null | grep -vF "$MARK" || true)"
+            printf '%s\n' "$KEEP" | crontab -
+            echo "[*] Печать по расписанию ВЫКЛЮЧЕНА."
+            exit 0 ;;
+          status)
+            if crontab -l 2>/dev/null | grep -qF "$MARK"; then
+                echo "[*] Печать по расписанию включена: каждый вторник в 12:00 (Баку)."
+            else
+                echo "[*] Печать по расписанию выключена (включить: netdiag print on)."
+            fi
+            tail -n 5 data/print.log 2>/dev/null || true
+            exit 0 ;;
+        esac
+        PL=az
+        for A in "$@"; do
+            case "$A" in
+              --az) PL=az ;;
+              --ru) PL=ru ;;
+              *) echo "Формат: netdiag print [--az | --ru]"; exit 1 ;;
+            esac
+        done
+        echo "[*] $(date '+%d.%m.%y %H:%M') Печать отчёта ($PL)..."
+        # первый запуск (и после правки Dockerfile.print) собирает образ — несколько минут
+        docker compose --profile print run --rm --build netdiag-print "$PL"
         ;;
 
       down)
